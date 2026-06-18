@@ -2,6 +2,7 @@ import type {
   AgentHarness,
   ContextEngineHostCapability,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
+import type { OpenCodeHarnessLogger } from "./logger.js";
 
 const OPENCODE_HARNESS_HOST_CAPABILITIES = [
   "bootstrap",
@@ -18,6 +19,7 @@ export function createOpenCodeAgentHarness(options?: {
   providerIds?: Iterable<string>;
   pluginConfig?: unknown;
   resolvePluginConfig?: () => unknown;
+  logger?: OpenCodeHarnessLogger;
 }): AgentHarness {
   const providerIds = new Set(
     [...(options?.providerIds ?? ["opencode"])].map((id) => id.trim().toLowerCase()),
@@ -48,6 +50,7 @@ export function createOpenCodeAgentHarness(options?: {
     runAttempt: async (params) => {
       const { runOpenCodeHarnessAttempt } = await import("./app-server/run-attempt.js");
       return runOpenCodeHarnessAttempt(params, {
+        logger: options?.logger,
         pluginConfig: options?.resolvePluginConfig?.() ?? options?.pluginConfig,
       });
     },
@@ -55,11 +58,15 @@ export function createOpenCodeAgentHarness(options?: {
       if (params.sessionFile) {
         const { clearOpenCodeHarnessBinding } = await import("./app-server/session-binding.js");
         await clearOpenCodeHarnessBinding(params.sessionFile);
+        options?.logger?.debug?.("cleared native session binding", {
+          sessionFile: params.sessionFile,
+        });
       }
     },
     dispose: async () => {
       const { clearSharedOpenCodeHarnessClientAndWait } = await import("./app-server/shared-client.js");
       await clearSharedOpenCodeHarnessClientAndWait();
+      options?.logger?.debug?.("disposed shared native client");
     },
   };
 }

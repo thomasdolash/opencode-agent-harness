@@ -3,6 +3,7 @@ import type {
   AgentHarnessAttemptResult,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { classifyAgentHarnessTerminalOutcome } from "openclaw/plugin-sdk/agent-harness-runtime";
+import type { OpenCodeHarnessLogger } from "../logger.js";
 import { resolveHarnessPluginConfig } from "./shared-client.js";
 import { createSharedOpenCodeHarnessClient } from "./shared-client.js";
 import {
@@ -179,7 +180,11 @@ function buildAttemptResult(params: {
 
 export async function runOpenCodeHarnessAttempt(
   params: AgentHarnessAttemptParams,
-  opts: { pluginConfig?: unknown; openCodeClient?: import("./shared-client.js").OpenCodeHarnessClient },
+  opts: {
+    pluginConfig?: unknown;
+    logger?: OpenCodeHarnessLogger;
+    openCodeClient?: import("./shared-client.js").OpenCodeHarnessClient;
+  },
 ): Promise<AgentHarnessAttemptResult> {
   const promptText = extractPromptText(params);
   const sessionFile = params.sessionFile;
@@ -205,12 +210,22 @@ export async function runOpenCodeHarnessAttempt(
   const binding = await readOpenCodeHarnessBinding(sessionFile);
   let openCodeSessionId = binding?.openCodeSessionId;
   if (!openCodeSessionId) {
+    opts.logger?.debug?.("creating native OpenCode session", {
+      modelId: params.modelId,
+      sessionFile,
+    });
     const created = await client.createSession();
     openCodeSessionId = created.id;
     await writeOpenCodeHarnessBinding(sessionFile, {
       openCodeSessionId,
       model: params.modelId,
       createdAt: new Date().toISOString(),
+    });
+  } else {
+    opts.logger?.debug?.("resuming native OpenCode session", {
+      modelId: params.modelId,
+      openCodeSessionId,
+      sessionFile,
     });
   }
 
@@ -230,6 +245,11 @@ export async function runOpenCodeHarnessAttempt(
     const requestPayload = {
       parts: [{ type: "text", text: promptText }],
     };
+    opts.logger?.debug?.("starting native turn", {
+      partialStreaming: Boolean(params.onPartialReply && client.streamMessage),
+      promptLength: promptText.length,
+      sessionFile,
+    });
     const response =
       params.onPartialReply && client.streamMessage
         ? await client.streamMessage(openCodeSessionId, requestPayload, {
@@ -248,6 +268,12 @@ export async function runOpenCodeHarnessAttempt(
       model: params.modelId,
       createdAt: binding?.createdAt ?? new Date().toISOString(),
     });
+    opts.logger?.debug?.("completed native OpenCode turn", {
+      finalTextLength: finalText.length,
+      hasReasoningText: reasoningText.trim() !== "",
+      openCodeSessionId,
+      sessionFile,
+    });
     return buildAttemptResult({
       sessionIdUsed: openCodeSessionId,
       sessionFileUsed: sessionFile,
@@ -256,6 +282,11 @@ export async function runOpenCodeHarnessAttempt(
       reasoningText,
     });
   } catch (error) {
+    opts.logger?.error?.("native OpenCode turn failed", {
+      error: String((error as Error)?.message ?? error),
+      openCodeSessionId,
+      sessionFile,
+    });
     throw new Error(`OpenCode harness turn failed: ${String((error as Error)?.message ?? error)}`);
   } finally {
     if (abortListener) {

@@ -2,6 +2,7 @@ import {
   parseOpenCodeAgentHarnessPluginConfig,
   type OpenCodeAgentHarnessPluginConfig,
 } from "../config.js";
+import type { OpenCodeHarnessLogger } from "../logger.js";
 
 type OpenCodeManagedServer = {
   url: string;
@@ -108,6 +109,7 @@ export function resolveHarnessPluginConfig(
 export async function createSharedOpenCodeHarnessClient(opts: {
   pluginConfig?: unknown;
   openCodeClient?: OpenCodeHarnessClient;
+  logger?: OpenCodeHarnessLogger;
   managedServerFactory?: (config: OpenCodeAgentHarnessPluginConfig) => Promise<OpenCodeManagedServer>;
   sdkClientFactory?: (baseUrl: string) => Promise<unknown> | unknown;
 }): Promise<OpenCodeHarnessClient> {
@@ -116,6 +118,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
   }
 
   if (sharedClient) {
+    opts.logger?.debug?.("reusing shared OpenCode client");
     return sharedClient;
   }
 
@@ -128,6 +131,10 @@ export async function createSharedOpenCodeHarnessClient(opts: {
     pluginConfig.server.mode === "managed"
       ? await ensureManagedOpenCodeServer(pluginConfig, opts.managedServerFactory)
       : resolveBaseUrl({ pluginConfig });
+  opts.logger?.debug?.("initializing OpenCode client", {
+    mode: pluginConfig.server.mode,
+    baseUrl,
+  });
   const client = await createSdkClient(baseUrl, opts.sdkClientFactory);
 
   sharedClient = {

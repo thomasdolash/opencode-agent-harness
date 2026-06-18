@@ -1,0 +1,76 @@
+{
+  "id": "opencode-agent-harness",
+  "name": "OpenCode Agent Harness",
+  "description": "Registers the native OpenCode agent harness.",
+  "activation": {
+    "onStartup": false,
+    "onAgentHarnesses": ["opencode"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "server": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": ["managed", "remote"]
+          },
+          "baseUrl": {
+            "type": "string",
+            "minLength": 1
+          },
+          "hostname": {
+            "type": "string",
+            "minLength": 1
+          },
+          "port": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "minVersion": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "required": ["server"]
+  },
+  "uiHints": {
+    "server": {
+      "label": "OpenCode Server",
+      "help": "Connection settings for the OpenCode native runtime."
+    },
+    "server.mode": {
+      "label": "Startup Mode",
+      "help": "Use managed to launch opencode serve inside the gateway process, or remote to connect to an existing server."
+    },
+    "server.baseUrl": {
+      "label": "Base URL",
+      "help": "Base URL for a remote opencode serve instance, for example http://127.0.0.1:4096."
+    },
+    "server.hostname": {
+      "label": "Hostname",
+      "help": "Managed-mode listen hostname for opencode serve. Defaults to 127.0.0.1."
+    },
+    "server.port": {
+      "label": "Port",
+      "help": "Managed-mode listen port for opencode serve. Defaults to 4096."
+    },
+    "server.timeoutMs": {
+      "label": "Startup Timeout",
+      "help": "Managed-mode startup timeout in milliseconds."
+    },
+    "server.minVersion": {
+      "label": "Minimum Version",
+      "help": "Optional minimum tested OpenCode server version."
+    }
+  }
+}

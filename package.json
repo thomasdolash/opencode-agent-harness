@@ -1,0 +1,40 @@
+{
+  "name": "@local/opencode-agent-harness",
+  "version": "2026.6.8",
+  "private": true,
+  "description": "OpenCode native agent harness plugin for OpenClaw",
+  "type": "module",
+  "files": [
+    "dist",
+    "openclaw.plugin.json",
+    "docs/ARCHITECTURE.md"
+  ],
+  "scripts": {
+    "build": "tsc -p ./tsconfig.json",
+    "typecheck": "tsc -p ./tsconfig.json --noEmit",
+    "smoke": "node --import tsx ./scripts/smoke-run-attempt.ts"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "*"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.6.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.30",
+    "openclaw": "^2026.6.8",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  },
+  "openclaw": {
+    "extensions": ["./src/index.ts"],
+    "compat": {
+      "pluginApi": ">=2026.6.8",
+      "minGatewayVersion": "2026.6.8"
+    },
+    "build": {
+      "openclawVersion": "2026.6.8",
+      "pluginSdkVersion": "2026.6.8"
+    }
+  }
+}

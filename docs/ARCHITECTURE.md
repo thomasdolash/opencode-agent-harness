@@ -186,6 +186,7 @@ Current reality:
 - user experience still often feels like "wait for the full message"
 - we have not yet proven that the current partial path maps cleanly onto
   OpenClaw's existing block/preview streaming behavior in a satisfying way
+- Work directory currently not yet set by plugin
 
 So streaming is not absent, but it is not yet a validated strong part of v1 UX.
 
@@ -208,19 +209,13 @@ So streaming is not absent, but it is not yet a validated strong part of v1 UX.
 
 These are real quirks observed so far.
 
-- runtime selection currently depends on a broader config hammer than we want
-- deployment can be sensitive to host/container ownership mismatches for linked
-  plugin paths
+- runtime selection currently depends on a broader config hammer than we want (not fully tested)
 - reasoning/thinking text can currently surface more directly than desired
   instead of always obeying OpenClaw's existing reasoning visibility controls
 - partial reply behavior is still weaker than ideal and can feel too close to
   final-only delivery
-- early-turn agent reasoning can still be messier than ideal even when the
-  underlying harness path is correct
-- local and container environments can drift if dependency state or mounted file
-  ownership changes unexpectedly
 
-None of those invalidate the MVP, but they are real.
+
 
 ## 7. Current Testing Convention
 
@@ -276,6 +271,10 @@ obvious gaps are:
 
 These are reasonable follow-up items.
 None are required to claim the current MVP works.
+
+Detailed research and implementation planning now live in:
+
+- `docs/IMPLEMENTATION-PLAN.md`
 
 ### Config and selection cleanup
 

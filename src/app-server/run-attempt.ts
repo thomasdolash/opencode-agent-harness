@@ -1,11 +1,18 @@
 import type {
   AgentHarnessAttemptParams,
   AgentHarnessAttemptResult,
+  AgentMessage,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
-import { classifyAgentHarnessTerminalOutcome } from "openclaw/plugin-sdk/agent-harness-runtime";
+import {
+  classifyAgentHarnessTerminalOutcome,
+} from "openclaw/plugin-sdk/agent-harness-runtime";
 import type { OpenCodeHarnessLogger } from "../logger.js";
 import { resolveHarnessPluginConfig } from "./shared-client.js";
 import { createSharedOpenCodeHarnessClient } from "./shared-client.js";
+import type {
+  OpenCodeHarnessTurnResult,
+  OpenCodeHarnessUsage,
+} from "./shared-client.js";
 import {
   readOpenCodeHarnessBinding,
   writeOpenCodeHarnessBinding,
@@ -41,6 +48,7 @@ function extractTextParts(parts: unknown): string[] {
       if (
         part &&
         typeof part === "object" &&
+        (!("type" in part) || (part as { type?: unknown }).type === "text") &&
         "text" in part &&
         typeof (part as { text: unknown }).text === "string"
       ) {
@@ -116,20 +124,83 @@ function extractResponseReasoningText(response: unknown): string {
     .trim();
 }
 
+function readTurnEnvelope(response: unknown): OpenCodeHarnessTurnResult | undefined {
+  if (!response || typeof response !== "object" || Array.isArray(response)) {
+    return undefined;
+  }
+  const record = response as Record<string, unknown>;
+  if (!("response" in record)) {
+    return undefined;
+  }
+  return response as OpenCodeHarnessTurnResult;
+}
+
+function buildUsageSnapshot(
+  usage: OpenCodeHarnessUsage | undefined,
+): NonNullable<AgentHarnessAttemptResult["lastAssistant"]>["usage"] | undefined {
+  if (!usage) {
+    return undefined;
+  }
+  const input = usage.input ?? 0;
+  const output = usage.output ?? 0;
+  const cacheRead = usage.cacheRead ?? 0;
+  const cacheWrite = usage.cacheWrite ?? 0;
+  const totalTokens =
+    usage.total ?? input + output + cacheRead + cacheWrite + (usage.reasoningTokens ?? 0);
+
+  const hasNonZero = [input, output, cacheRead, cacheWrite, totalTokens].some((value) => value > 0);
+  if (!hasNonZero) {
+    return undefined;
+  }
+
+  return {
+    input,
+    output,
+    cacheRead,
+    cacheWrite,
+    totalTokens,
+    cost: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      total: 0,
+    },
+  };
+}
+
 function buildAttemptResult(params: {
   sessionIdUsed: string;
   sessionFileUsed: string;
+  provider: string;
+  modelId?: string;
   promptText: string;
   finalText: string;
   reasoningText?: string;
+  toolMetas?: AgentHarnessAttemptResult["toolMetas"];
+  usage?: OpenCodeHarnessUsage;
 }): AgentHarnessAttemptResult {
   const assistantTexts = params.finalText ? [params.finalText] : [];
+  const usageSnapshot = buildUsageSnapshot(params.usage);
   const assistantMessage = params.finalText
     ? ({
         role: "assistant",
         content: [{ type: "text", text: params.finalText }],
+        provider: params.provider,
+        model: params.modelId,
+        ...(usageSnapshot ? { usage: usageSnapshot } : {}),
+        stopReason: "stop",
+        timestamp: Date.now(),
       } as AgentHarnessAttemptResult["lastAssistant"])
     : undefined;
+  const messagesSnapshot: AgentMessage[] = [
+    {
+      role: "user",
+      content: params.promptText,
+      timestamp: Date.now(),
+    } as AgentMessage,
+    ...(assistantMessage ? [assistantMessage as AgentMessage] : []),
+  ];
 
   return {
     aborted: false,
@@ -143,9 +214,9 @@ function buildAttemptResult(params: {
     sessionIdUsed: params.sessionIdUsed,
     sessionFileUsed: params.sessionFileUsed,
     finalPromptText: params.promptText,
-    messagesSnapshot: [],
+    messagesSnapshot,
     assistantTexts,
-    toolMetas: [],
+    toolMetas: params.toolMetas ?? [],
     acceptedSessionSpawns: [],
     lastAssistant: assistantMessage,
     currentAttemptAssistant: assistantMessage,
@@ -154,6 +225,7 @@ function buildAttemptResult(params: {
     messagingToolSentMediaUrls: [],
     messagingToolSentTargets: [],
     cloudCodeAssistFormatError: false,
+    ...(params.usage ? { attemptUsage: params.usage } : {}),
     ...(classifyAgentHarnessTerminalOutcome({
       assistantTexts,
       reasoningText: params.reasoningText,
@@ -188,6 +260,9 @@ export async function runOpenCodeHarnessAttempt(
 ): Promise<AgentHarnessAttemptResult> {
   const promptText = extractPromptText(params);
   const sessionFile = params.sessionFile;
+  const requestContext = {
+    directory: params.cwd ?? params.workspaceDir,
+  };
 
   if (typeof sessionFile !== "string" || sessionFile.trim() === "") {
     throw new Error("OpenCode harness requires params.sessionFile for binding persistence");
@@ -211,10 +286,11 @@ export async function runOpenCodeHarnessAttempt(
   let openCodeSessionId = binding?.openCodeSessionId;
   if (!openCodeSessionId) {
     opts.logger?.debug?.("creating native OpenCode session", {
+      directory: requestContext.directory,
       modelId: params.modelId,
       sessionFile,
     });
-    const created = await client.createSession();
+    const created = await client.createSession(undefined, requestContext);
     openCodeSessionId = created.id;
     await writeOpenCodeHarnessBinding(sessionFile, {
       openCodeSessionId,
@@ -254,15 +330,36 @@ export async function runOpenCodeHarnessAttempt(
       params.onPartialReply && client.streamMessage
         ? await client.streamMessage(openCodeSessionId, requestPayload, {
             abortSignal: params.abortSignal,
+            onAssistantMessageStart: async () => {
+              await params.onAssistantMessageStart?.();
+            },
+            onToolEvent: async (payload) => {
+              await params.onAgentEvent?.({
+                stream: "tool",
+                data: {
+                  phase: payload.phase,
+                  name: payload.toolName,
+                  ...(payload.toolCallId ? { toolCallId: payload.toolCallId } : {}),
+                },
+              });
+            },
             onPartialText: (payload) =>
               params.onPartialReply?.({
                 text: payload.text,
                 ...(payload.delta ? { delta: payload.delta } : {}),
               }),
-          })
-        : await client.message(openCodeSessionId, requestPayload);
-    const finalText = extractResponseText(response);
-    const reasoningText = extractResponseReasoningText(response);
+          }, requestContext)
+        : await client.message(openCodeSessionId, requestPayload, requestContext);
+    const turnEnvelope = readTurnEnvelope(response);
+    const responsePayload = turnEnvelope?.response ?? response;
+    const finalText =
+      typeof turnEnvelope?.finalText === "string" && turnEnvelope.finalText.trim() !== ""
+        ? turnEnvelope.finalText.trim()
+        : extractResponseText(responsePayload);
+    const reasoningText =
+      typeof turnEnvelope?.reasoningText === "string" && turnEnvelope.reasoningText.trim() !== ""
+        ? turnEnvelope.reasoningText.trim()
+        : extractResponseReasoningText(responsePayload);
     await writeOpenCodeHarnessBinding(sessionFile, {
       openCodeSessionId,
       model: params.modelId,
@@ -277,9 +374,13 @@ export async function runOpenCodeHarnessAttempt(
     return buildAttemptResult({
       sessionIdUsed: openCodeSessionId,
       sessionFileUsed: sessionFile,
+      provider: params.provider,
+      modelId: params.modelId,
       promptText,
       finalText,
       reasoningText,
+      toolMetas: turnEnvelope?.toolMetas as AgentHarnessAttemptResult["toolMetas"] | undefined,
+      usage: turnEnvelope?.usage,
     });
   } catch (error) {
     opts.logger?.error?.("native OpenCode turn failed", {

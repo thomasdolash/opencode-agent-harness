@@ -765,7 +765,8 @@ The remaining streaming problem is therefore likely one of:
 - reasoning visibility not being bridged as a first-class host signal
 - the UI consuming the final block lane instead of the progressive assistant
   lane
-- the CLI/gateway path buffering visible output until turn completion
+- the Gateway chat-completions adapter only seeing the final block lane for the
+  `opencode` harness instead of the progressive assistant lane
 - the harness still relying on a mixed event projector that merges
   `message.part.updated`, `message.part.delta`, and `session.next.text.*`
   instead of one narrow canonical assistant-text surface
@@ -796,6 +797,10 @@ Report comparison notes that should stay attached to the plan:
 - the healthy baseline remains: raw OpenCode SSE emits incremental assistant
   deltas, so if WebUI still shows a final wall of text, the remaining fault is
   between the harness projector and OpenClaw's progressive delivery path
+- the same issue now reproduces on the OpenAI-compatible Gateway SSE endpoint:
+  `openclaw/default` streams many incremental chunks, while
+  `openclaw/opencode` emits a single final content chunk. That removes CLI/UI
+  ambiguity from the diagnosis.
 
 The main caution is that `thinkLevel` is not the same thing as reasoning
 visibility. If the next change conflates those, we will keep chasing the wrong
@@ -805,10 +810,15 @@ problem.
 
 1. Map OpenCode reasoning events into OpenClaw reasoning callbacks without
    leaking them into visible assistant text.
-2. Verify live OpenClaw stream/block settings before blaming the SDK bridge.
-3. Add a small event-projector layer only if direct forwarding still does not
-   give enough control.
-4. Keep the harness narrow; do not broaden into provider/tool/permission bridge
+2. Inspect the OpenClaw Gateway chat-completions adapter path and confirm which
+   harness callback (`onPartialReply` vs final block delivery) becomes SSE
+   `delta.content` chunks.
+3. Compare the builtin default harness and `opencode` harness callback traces on
+   that adapter path so we can see whether `opencode` partials are missing,
+   deduped away, or arriving too late.
+4. Only after that comparison, adjust the harness projector or the host adapter
+   so progressive assistant text reaches the Gateway SSE delta lane.
+5. Keep the harness narrow; do not broaden into provider/tool/permission bridge
    work unless a concrete gap forces it.
 
 ### Useful logs to watch

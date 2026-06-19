@@ -53,12 +53,32 @@ npm run typecheck
 npm run smoke
 ```
 
-Run the live gateway probe against a real OpenClaw -> OpenCode route:
+Run the live gateway probe against the real OpenClaw HTTP SSE surface:
 
 ```bash
 npm run probe:live
-npm run probe:live -- --agent opencode
+npm run probe:live -- --verbose
 ```
+
+The probe compares `openclaw/default` against `openclaw/opencode` on
+`/v1/chat/completions` with `stream: true`.
+
+OpenClaw must expose chat completions explicitly:
+
+```json5
+{
+  gateway: {
+    http: {
+      endpoints: {
+        chatCompletions: { enabled: true },
+      },
+    },
+  },
+}
+```
+
+Without that setting, `/v1/models` and `/v1/chat/completions` may resolve to
+the Control UI shell instead of the Gateway API.
 
 ## Known-Good Usage Shape
 
@@ -95,7 +115,9 @@ The main known follow-up gaps are:
 - runtime selection is still broader than desired in the current OpenClaw config
 - reasoning visibility is not yet fully aligned with OpenClaw's existing
   `/reasoning on|off|stream` controls
-- progressive streaming behavior still needs improvement
+- progressive streaming behavior still needs improvement; on the real Gateway
+  SSE endpoint, `openclaw/default` currently streams incrementally while
+  `openclaw/opencode` still collapses to a single final content chunk
 
 See [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for the detailed
 done/not-done/next-work breakdown.

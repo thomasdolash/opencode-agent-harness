@@ -5,6 +5,7 @@ import type {
 } from "openclaw/plugin-sdk/agent-harness-runtime";
 import {
   classifyAgentHarnessTerminalOutcome,
+  emitAgentEvent,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
 import type { OpenCodeHarnessLogger } from "../logger.js";
 import { resolveHarnessPluginConfig } from "./shared-client.js";
@@ -167,6 +168,29 @@ function buildUsageSnapshot(
       total: 0,
     },
   };
+}
+
+function emitHarnessAgentEvent(params: {
+  runId: string;
+  sessionKey?: string;
+  event: {
+    stream: "assistant" | "reasoning" | "tool" | "lifecycle" | string;
+    data: Record<string, unknown>;
+  };
+  onAgentEvent?: (event: { stream: string; data: Record<string, unknown> }) => void | Promise<void>;
+}): Promise<void> {
+  try {
+    emitAgentEvent({
+      runId: params.runId,
+      stream: params.event.stream,
+      data: params.event.data,
+      ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
+    });
+  } catch {
+    // Best effort only: local harness runs should not fail just because the
+    // global OpenClaw agent-event bus is unavailable.
+  }
+  return Promise.resolve(params.onAgentEvent?.(params.event)).then(() => undefined);
 }
 
 function buildAttemptResult(params: {
@@ -343,23 +367,34 @@ export async function runOpenCodeHarnessAttempt(
             abortSignal: params.abortSignal,
             timeoutMs: params.timeoutMs,
             reasoningLevel: params.reasoningLevel,
+            logger: opts.logger,
             onAssistantMessageStart: async () => {
-              await params.onAgentEvent?.({
-                stream: "assistant",
-                data: {
-                  phase: "start",
+              await emitHarnessAgentEvent({
+                runId: params.runId,
+                sessionKey: params.sessionKey,
+                event: {
+                  stream: "assistant",
+                  data: {
+                    phase: "start",
+                  },
                 },
+                onAgentEvent: params.onAgentEvent,
               });
               await params.onAssistantMessageStart?.();
             },
             onToolEvent: async (payload) => {
-              await params.onAgentEvent?.({
-                stream: "tool",
-                data: {
-                  phase: payload.phase,
-                  name: payload.toolName,
-                  ...(payload.toolCallId ? { toolCallId: payload.toolCallId } : {}),
+              await emitHarnessAgentEvent({
+                runId: params.runId,
+                sessionKey: params.sessionKey,
+                event: {
+                  stream: "tool",
+                  data: {
+                    phase: payload.phase,
+                    name: payload.toolName,
+                    ...(payload.toolCallId ? { toolCallId: payload.toolCallId } : {}),
+                  },
                 },
+                onAgentEvent: params.onAgentEvent,
               });
             },
             onPartialText: (payload) =>
@@ -368,12 +403,17 @@ export async function runOpenCodeHarnessAttempt(
                   text: payload.text,
                   ...(payload.delta ? { delta: payload.delta } : {}),
                 }),
-                params.onAgentEvent?.({
-                  stream: "assistant",
-                  data: {
-                    text: payload.text,
-                    ...(payload.delta ? { delta: payload.delta } : {}),
+                emitHarnessAgentEvent({
+                  runId: params.runId,
+                  sessionKey: params.sessionKey,
+                  event: {
+                    stream: "assistant",
+                    data: {
+                      text: payload.text,
+                      ...(payload.delta ? { delta: payload.delta } : {}),
+                    },
                   },
+                  onAgentEvent: params.onAgentEvent,
                 }),
               ]).then(() => undefined),
             onReasoningStream: (payload) =>
@@ -382,21 +422,31 @@ export async function runOpenCodeHarnessAttempt(
                   text: payload.text,
                   ...(payload.delta ? { delta: payload.delta } : {}),
                 }),
-                params.onAgentEvent?.({
-                  stream: "reasoning",
-                  data: {
-                    text: payload.text,
-                    ...(payload.delta ? { delta: payload.delta } : {}),
+                emitHarnessAgentEvent({
+                  runId: params.runId,
+                  sessionKey: params.sessionKey,
+                  event: {
+                    stream: "reasoning",
+                    data: {
+                      text: payload.text,
+                      ...(payload.delta ? { delta: payload.delta } : {}),
+                    },
                   },
+                  onAgentEvent: params.onAgentEvent,
                 }),
               ]).then(() => undefined),
             onReasoningEnd: async () => {
               await params.onReasoningEnd?.();
-              await params.onAgentEvent?.({
-                stream: "reasoning",
-                data: {
-                  phase: "end",
+              await emitHarnessAgentEvent({
+                runId: params.runId,
+                sessionKey: params.sessionKey,
+                event: {
+                  stream: "reasoning",
+                  data: {
+                    phase: "end",
+                  },
                 },
+                onAgentEvent: params.onAgentEvent,
               });
             },
             onBlockReply: (payload) =>

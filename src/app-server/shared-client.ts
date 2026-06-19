@@ -51,6 +51,7 @@ export type OpenCodeHarnessClient = {
       abortSignal?: AbortSignal;
       timeoutMs?: number;
       reasoningLevel?: "off" | "on" | "stream" | string;
+      logger?: OpenCodeHarnessLogger;
       onPartialText?: (payload: { text: string; delta?: string }) => void | Promise<void>;
       onReasoningStream?: (payload: { text: string; delta?: string }) => void | Promise<void>;
       onReasoningEnd?: () => void | Promise<void>;
@@ -101,6 +102,44 @@ function readString(value: unknown): string | undefined {
 
 function readNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function readSessionId(value: unknown): string | undefined {
+  const record = readRecord(value);
+  return readString(record?.sessionID) ?? readString(record?.sessionId) ?? readString(record?.session_id);
+}
+
+function readMessageId(value: unknown): string | undefined {
+  const record = readRecord(value);
+  return readString(record?.messageID) ?? readString(record?.messageId) ?? readString(record?.message_id) ?? readString(record?.id);
+}
+
+function readAssistantMessageId(value: unknown): string | undefined {
+  const record = readRecord(value);
+  return readString(record?.assistantMessageID) ?? readString(record?.assistantMessageId) ?? readString(record?.assistant_message_id);
+}
+
+function resolvePartialDelta(previousText: string, nextText: string, explicitDelta: string | undefined): string | undefined {
+  if (explicitDelta) {
+    return explicitDelta;
+  }
+  if (previousText && nextText.startsWith(previousText)) {
+    return nextText.slice(previousText.length) || undefined;
+  }
+  return undefined;
+}
+
+function resolveNextPartialText(previousText: string, nextText: string, explicitDelta: string | undefined): string | undefined {
+  if (!nextText) {
+    if (!explicitDelta) {
+      return undefined;
+    }
+    return `${previousText}${explicitDelta}`;
+  }
+  if (nextText === previousText) {
+    return undefined;
+  }
+  return nextText;
 }
 
 function resolveQueryContext(
@@ -238,6 +277,11 @@ function resolveTurnWaitTimeoutMs(timeoutMs: number | undefined): number {
     return 60_000;
   }
   return timeoutMs;
+}
+
+function isStreamDebugEnabled(): boolean {
+  const raw = process.env.OPENCODE_HARNESS_STREAM_DEBUG?.trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw == "yes";
 }
 
 function isAbortLikeError(error: unknown): boolean {
@@ -438,6 +482,76 @@ export async function createSharedOpenCodeHarnessClient(opts: {
       const knownAssistantMessageIds = new Set<string>();
       let partialText = "";
       let reasoningText = "";
+      const streamDebug = isStreamDebugEnabled();
+
+      const debugStreamEvent = (message: string, meta?: Record<string, unknown>) => {
+        if (!streamDebug) {
+          return;
+        }
+        opts?.logger?.debug?.(message, {
+          sessionId,
+          ...(meta ?? {}),
+        });
+      };
+
+      const noteAssistantMessageId = (messageId: string | undefined): string | undefined => {
+        if (!messageId) {
+          return undefined;
+        }
+        knownAssistantMessageIds.add(messageId);
+        const previousTarget = targetAssistantMessageId;
+        targetAssistantMessageId ??= messageId;
+        debugStreamEvent('observed assistant message id', {
+          messageId,
+          previousTargetAssistantMessageId: previousTarget,
+          targetAssistantMessageId,
+          knownAssistantMessageCount: knownAssistantMessageIds.size,
+        });
+        return messageId;
+      };
+
+      const emitAssistantStart = async () => {
+        if (assistantStarted) {
+          debugStreamEvent('skipping assistant start', {
+            reason: 'already-started',
+          });
+          return;
+        }
+        assistantStarted = true;
+        debugStreamEvent('emitting assistant start', {
+          targetAssistantMessageId,
+        });
+        await opts?.onAssistantMessageStart?.();
+      };
+
+      const emitAssistantPartial = async (nextText: string, explicitDelta?: string) => {
+        const previousText = partialText;
+        const resolvedText = resolveNextPartialText(partialText, nextText, explicitDelta);
+        if (!resolvedText) {
+          debugStreamEvent('skipping assistant partial', {
+            reason: 'no-resolved-text',
+            previousLength: previousText.length,
+            nextLength: nextText.length,
+            explicitDeltaLength: explicitDelta?.length ?? 0,
+          });
+          return;
+        }
+        const resolvedDelta = resolvePartialDelta(partialText, resolvedText, explicitDelta);
+        partialText = resolvedText;
+        debugStreamEvent('emitting assistant partial', {
+          previousLength: previousText.length,
+          nextLength: nextText.length,
+          resolvedLength: resolvedText.length,
+          explicitDeltaLength: explicitDelta?.length ?? 0,
+          resolvedDeltaLength: resolvedDelta?.length ?? 0,
+          targetAssistantMessageId,
+        });
+        await emitAssistantStart();
+        await opts?.onPartialText?.({
+          text: partialText,
+          ...(resolvedDelta ? { delta: resolvedDelta } : {}),
+        });
+      };
       let lastReasoningText = "";
       let sawPromptActivity = false;
       let sessionError: string | undefined;
@@ -469,15 +583,14 @@ export async function createSharedOpenCodeHarnessClient(opts: {
               continue;
             }
             lastEventAt = Date.now();
+            debugStreamEvent('received OpenCode event', {
+              eventType,
+            });
 
             if (eventType === "message.updated") {
               const info = readRecord(properties.info);
-              if (info?.sessionID === sessionId && info.role === "assistant") {
-                const assistantMessageId = readString(info.id);
-                if (assistantMessageId) {
-                  knownAssistantMessageIds.add(assistantMessageId);
-                  targetAssistantMessageId = assistantMessageId;
-                }
+              if (readSessionId(info) === sessionId && info?.role === "assistant") {
+                noteAssistantMessageId(readMessageId(info));
                 sawPromptActivity = true;
               }
               continue;
@@ -485,19 +598,29 @@ export async function createSharedOpenCodeHarnessClient(opts: {
 
             if (eventType === "message.part.updated") {
               const part = readRecord(properties.part);
-              if (!part || part.sessionID !== sessionId) {
+              if (!part || readSessionId(part) !== sessionId) {
                 continue;
               }
 
-              const messageId = readString(part.messageID);
+              const messageId = readMessageId(part);
               const partType = readString(part.type);
               if (!messageId || !knownAssistantMessageIds.has(messageId)) {
+                debugStreamEvent('skipping message.part.updated', {
+                  reason: !messageId ? 'missing-message-id' : 'unknown-assistant-message-id',
+                  messageId,
+                  partType,
+                  knownAssistantMessageCount: knownAssistantMessageIds.size,
+                });
                 continue;
               }
-              if (!targetAssistantMessageId) {
-                targetAssistantMessageId = messageId;
-              }
+              targetAssistantMessageId ??= messageId;
               if (messageId !== targetAssistantMessageId) {
+                debugStreamEvent('skipping message.part.updated', {
+                  reason: 'non-target-assistant-message-id',
+                  messageId,
+                  targetAssistantMessageId,
+                  partType,
+                });
                 continue;
               }
 
@@ -506,10 +629,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
               if (partType === "reasoning") {
                 reasoningText = nextText;
                 if (reasoningEnabled) {
-                  const delta =
-                    lastReasoningText && nextText.startsWith(lastReasoningText)
-                      ? nextText.slice(lastReasoningText.length)
-                      : nextText;
+                  const delta = resolvePartialDelta(lastReasoningText, nextText, readString(properties.delta));
                   lastReasoningText = nextText;
                   await opts?.onReasoningStream?.({
                     text: reasoningText,
@@ -522,22 +642,13 @@ export async function createSharedOpenCodeHarnessClient(opts: {
                 continue;
               }
 
-              const delta = readString(properties.delta);
-              if (!nextText) {
-                continue;
-              }
-
-              partialText = nextText;
-              await opts?.onPartialText?.({
-                text: partialText,
-                ...(delta ? { delta } : {}),
-              });
+              await emitAssistantPartial(nextText, readString(properties.delta));
               continue;
             }
 
-            if (eventType === "message.part.delta" && properties.sessionID === sessionId) {
+            if (eventType === "message.part.delta" && readSessionId(properties) === sessionId) {
               const field = readString(properties.field);
-              const messageId = readString(properties.messageID);
+              const messageId = readMessageId(properties);
               const delta = readString(properties.delta);
               if (field !== "text" || !messageId || !delta) {
                 continue;
@@ -545,73 +656,78 @@ export async function createSharedOpenCodeHarnessClient(opts: {
 
               if (!knownAssistantMessageIds.has(messageId)) {
                 if (knownAssistantMessageIds.size > 0) {
+                  debugStreamEvent('skipping message.part.delta', {
+                    reason: 'unknown-assistant-message-id',
+                    messageId,
+                    targetAssistantMessageId,
+                    knownAssistantMessageCount: knownAssistantMessageIds.size,
+                  });
                   continue;
                 }
-                knownAssistantMessageIds.add(messageId);
-              }
-              if (!targetAssistantMessageId) {
-                targetAssistantMessageId = messageId;
+                noteAssistantMessageId(messageId);
               }
               if (messageId !== targetAssistantMessageId) {
+                debugStreamEvent('skipping message.part.delta', {
+                  reason: 'non-target-assistant-message-id',
+                  messageId,
+                  targetAssistantMessageId,
+                });
                 continue;
               }
 
               sawPromptActivity = true;
-              if (!assistantStarted) {
-                assistantStarted = true;
-                await opts?.onAssistantMessageStart?.();
-              }
-              partialText += delta;
-              await opts?.onPartialText?.({
-                text: partialText,
-                delta,
+              debugStreamEvent('accepting message.part.delta', {
+                messageId,
+                deltaLength: delta.length,
+                partialLengthBefore: partialText.length,
               });
+              await emitAssistantPartial(`${partialText}${delta}`, delta);
               continue;
             }
 
-            if (eventType === "session.next.text.started" && properties.sessionID === sessionId) {
-              targetAssistantMessageId =
-                readString(properties.assistantMessageID) ?? targetAssistantMessageId;
+            if (eventType === "session.next.text.started" && readSessionId(properties) === sessionId) {
+              noteAssistantMessageId(readAssistantMessageId(properties));
               sawPromptActivity = true;
-              if (!assistantStarted) {
-                assistantStarted = true;
-                await opts?.onAssistantMessageStart?.();
-              }
+              await emitAssistantStart();
               continue;
             }
 
-            if (eventType === "session.next.text.delta" && properties.sessionID === sessionId) {
-              targetAssistantMessageId =
-                readString(properties.assistantMessageID) ?? targetAssistantMessageId;
+            if (eventType === "session.next.text.delta" && readSessionId(properties) === sessionId) {
+              noteAssistantMessageId(readAssistantMessageId(properties));
               sawPromptActivity = true;
               const delta = readString(properties.delta);
               if (!delta) {
+                debugStreamEvent('skipping session.next.text.delta', {
+                  reason: 'missing-delta',
+                });
                 continue;
               }
-              partialText += delta;
-              await opts?.onPartialText?.({
-                text: partialText,
-                delta,
+              debugStreamEvent('accepting session.next.text.delta', {
+                deltaLength: delta.length,
+                partialLengthBefore: partialText.length,
               });
+              await emitAssistantPartial(`${partialText}${delta}`, delta);
               continue;
             }
 
-            if (eventType === "session.next.text.ended" && properties.sessionID === sessionId) {
-              targetAssistantMessageId =
-                readString(properties.assistantMessageID) ?? targetAssistantMessageId;
+            if (eventType === "session.next.text.ended" && readSessionId(properties) === sessionId) {
+              noteAssistantMessageId(readAssistantMessageId(properties));
               sawPromptActivity = true;
               const text = readString(properties.text);
               if (!text) {
+                debugStreamEvent('skipping session.next.text.ended', {
+                  reason: 'missing-text',
+                });
                 continue;
               }
-              partialText = text;
-              await opts?.onPartialText?.({
-                text: partialText,
+              debugStreamEvent('accepting session.next.text.ended', {
+                textLength: text.length,
               });
+              await emitAssistantPartial(text);
               continue;
             }
 
-            if (eventType === "session.next.reasoning.delta" && properties.sessionID === sessionId) {
+            if (eventType === "session.next.reasoning.delta" && readSessionId(properties) === sessionId) {
               const delta = readString(properties.delta);
               if (!delta) {
                 continue;
@@ -627,7 +743,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
               continue;
             }
 
-            if (eventType === "session.next.reasoning.ended" && properties.sessionID === sessionId) {
+            if (eventType === "session.next.reasoning.ended" && readSessionId(properties) === sessionId) {
               const text = readString(properties.text);
               if (!text) {
                 continue;
@@ -644,7 +760,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
               continue;
             }
 
-            if (eventType === "session.next.tool.called" && properties.sessionID === sessionId) {
+            if (eventType === "session.next.tool.called" && readSessionId(properties) === sessionId) {
               const toolCallId = readString(properties.callID) ?? "";
               const toolName = readString(properties.tool);
               if (!toolName) {
@@ -661,7 +777,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
               continue;
             }
 
-            if (eventType === "session.next.tool.progress" && properties.sessionID === sessionId) {
+            if (eventType === "session.next.tool.progress" && readSessionId(properties) === sessionId) {
               const toolCallId = readString(properties.callID) ?? "";
               const toolName = toolMetas.get(toolCallId)?.toolName;
               if (!toolName) {
@@ -676,7 +792,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
               continue;
             }
 
-            if (eventType === "session.next.tool.success" && properties.sessionID === sessionId) {
+            if (eventType === "session.next.tool.success" && readSessionId(properties) === sessionId) {
               const toolCallId = readString(properties.callID) ?? "";
               const toolName = toolMetas.get(toolCallId)?.toolName;
               if (!toolName) {
@@ -691,7 +807,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
               continue;
             }
 
-            if (eventType === "session.next.tool.failed" && properties.sessionID === sessionId) {
+            if (eventType === "session.next.tool.failed" && readSessionId(properties) === sessionId) {
               const toolCallId = readString(properties.callID) ?? "";
               const toolName = toolMetas.get(toolCallId)?.toolName;
               if (!toolName) {
@@ -706,7 +822,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
               continue;
             }
 
-            if (eventType === "session.next.step.ended" && properties.sessionID === sessionId) {
+            if (eventType === "session.next.step.ended" && readSessionId(properties) === sessionId) {
               const tokens = readRecord(properties.tokens);
               if (tokens) {
                 usage = {
@@ -727,7 +843,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
               break;
             }
 
-            if (eventType === "session.error" && properties.sessionID === sessionId) {
+            if (eventType === "session.error" && readSessionId(properties) === sessionId) {
               const errorMessage =
                 readString(readRecord(properties.error)?.message) ??
                 readString(readRecord(readRecord(properties.error)?.data)?.message) ??
@@ -741,9 +857,9 @@ export async function createSharedOpenCodeHarnessClient(opts: {
 
             if (
               sawPromptActivity &&
-              ((eventType === "session.idle" && properties.sessionID === sessionId) ||
+              ((eventType === "session.idle" && readSessionId(properties) === sessionId) ||
                 (eventType === "session.status" &&
-                  properties.sessionID === sessionId &&
+                  readSessionId(properties) === sessionId &&
                   readRecord(properties.status)?.type === "idle"))
             ) {
               await opts?.onBlockReplyFlush?.();

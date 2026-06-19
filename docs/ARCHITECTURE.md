@@ -212,6 +212,10 @@ Confirmed streaming findings worth preserving:
 - the OpenClaw default agent already streams acceptably in the same WebUI, so
   the remaining problem is harness-local rather than a blanket gateway/UI
   failure
+- once `gateway.http.endpoints.chatCompletions.enabled` was turned on, the same
+  pattern reproduced on the documented Gateway SSE endpoint:
+  `openclaw/default` streamed incrementally while `openclaw/opencode` collapsed
+  to one final content chunk
 - an earlier harness bug pushed too much emphasis onto block-lane theories, but
   the current live code no longer mirrors every partial into `onBlockReply`
 - the sharper live bug was assistant-message identification: OpenCode can emit

@@ -1,8 +1,17 @@
 #!/usr/bin/env -S node --import tsx
 
+// This smoke suite validates local harness seams and event projection behavior.
+// It does not prove end-to-end Gateway SSE chunking. The real HTTP comparison
+// still needs the live OpenClaw Gateway surface with
+// `gateway.http.endpoints.chatCompletions.enabled = true`.
+
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import {
+  onAgentEvent,
+  resetAgentEventsForTest,
+} from "openclaw/plugin-sdk/agent-harness-runtime";
 import type { EmbeddedRunAttemptParams } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { runOpenCodeHarnessAttempt } from "../src/app-server/run-attempt.js";
 import {
@@ -34,6 +43,7 @@ const streamedTimeouts: number[] = [];
 let managedServerStarts = 0;
 let managedServerStops = 0;
 const managedClientBaseUrls: string[] = [];
+const globalAssistantEventTexts: string[] = [];
 
 const fakeClient = {
   async createSession(_payload?: unknown, context?: { directory?: string; workspace?: string }) {
@@ -262,7 +272,19 @@ streamedBlockFlushes = 0;
 streamedAssistantEvents.length = 0;
 streamedReasoningEvents.length = 0;
 streamedToolPhases.length = 0;
+globalAssistantEventTexts.length = 0;
+resetAgentEventsForTest();
+const stopGlobalEventCapture = onAgentEvent((evt) => {
+  if (evt.runId !== "run-streamed-prompt" || evt.stream !== "assistant") {
+    return;
+  }
+  const data = evt.data as { text?: string; delta?: string; phase?: string } | undefined;
+  globalAssistantEventTexts.push(
+    [data?.phase ?? "", data?.delta ?? data?.text ?? ""].filter(Boolean).join(":")
+  );
+});
 const streamedResult = await runOpenCodeHarnessAttempt(makeStreamingParams("streamed prompt"), opts);
+stopGlobalEventCapture();
 if (streamedResult.assistantTexts.join("\n") !== "reply-2") {
   throw new Error(`expected streamed assistant text reply-2, saw ${streamedResult.assistantTexts.join("\n")}`);
 }
@@ -275,6 +297,11 @@ if (streamedBlocks.join("|") !== "reply|reply-2") {
 if (streamedAssistantEvents.join("|") !== "start|reply|reply-2") {
   throw new Error(
     `expected streamed assistant events start|reply|reply-2, saw ${streamedAssistantEvents.join("|")}`,
+  );
+}
+if (globalAssistantEventTexts.join("|") !== "start|reply|-2") {
+  throw new Error(
+    `expected global assistant event trace start|reply|-2, saw ${globalAssistantEventTexts.join("|")}`,
   );
 }
 if (
@@ -878,6 +905,130 @@ if ((orderedEventResult as { finalText?: string }).finalText !== "hello world") 
 if (orderedEventPartials.join("|") !== "hello|hello world") {
   throw new Error(
     `expected ordered-event partials hello|hello world, saw ${orderedEventPartials.join("|")}`,
+  );
+}
+
+await clearSharedOpenCodeHarnessClientAndWait();
+const updatedDeltaPartials: string[] = [];
+const updatedDeltaClient = await createSharedOpenCodeHarnessClient({
+  pluginConfig: {
+    server: {
+      mode: "remote",
+      baseUrl: "http://unused-for-smoke.test",
+    },
+  },
+  sdkClientFactory: async () => ({
+    health: async () => ({ ok: true, version: "2026.6.8" }),
+    session: {
+      create: fakeClient.createSession,
+      promptAsync: async () => {},
+      messages: async () => [
+        {
+          info: {
+            id: "assistant-updated-delta",
+            role: "assistant",
+            time: { created: Date.now() },
+          },
+          parts: [{ type: "text", text: "hello world" }],
+        },
+      ],
+      abort: async () => fakeClient.abort(),
+    },
+    event: {
+      subscribe: async () => ({
+        stream: (async function* () {
+          yield {
+            directory: tempRoot,
+            payload: {
+              type: "message.updated",
+              properties: {
+                info: {
+                  id: "assistant-updated-delta",
+                  role: "assistant",
+                  sessionID: "open-code-session-updated-delta",
+                },
+              },
+            },
+          };
+          yield {
+            directory: tempRoot,
+            payload: {
+              type: "message.part.updated",
+              properties: {
+                part: {
+                  messageID: "assistant-updated-delta",
+                  type: "text",
+                  text: "hello",
+                  sessionID: "open-code-session-updated-delta",
+                },
+                delta: "hello",
+              },
+            },
+          };
+          yield {
+            directory: tempRoot,
+            payload: {
+              type: "message.part.updated",
+              properties: {
+                part: {
+                  messageID: "assistant-updated-delta",
+                  type: "text",
+                  text: "hello world",
+                  sessionID: "open-code-session-updated-delta",
+                },
+                delta: " world",
+              },
+            },
+          };
+          yield {
+            directory: tempRoot,
+            payload: {
+              type: "message.part.updated",
+              properties: {
+                part: {
+                  messageID: "assistant-updated-delta",
+                  type: "text",
+                  text: "hello world",
+                  sessionID: "open-code-session-updated-delta",
+                },
+              },
+            },
+          };
+          yield {
+            directory: tempRoot,
+            payload: {
+              type: "session.idle",
+              properties: {
+                sessionID: "open-code-session-updated-delta",
+              },
+            },
+          };
+        })(),
+      }),
+    },
+  }),
+});
+const updatedDeltaResult = await updatedDeltaClient.streamMessage?.(
+  "open-code-session-updated-delta",
+  { parts: [{ type: "text", text: "prefer updated deltas" }] },
+  {
+    onPartialText: async (payload) => {
+      updatedDeltaPartials.push(payload.text);
+    },
+  },
+  { directory: tempRoot },
+);
+if (!updatedDeltaResult || typeof updatedDeltaResult !== "object") {
+  throw new Error("expected updated-delta stream client result");
+}
+if ((updatedDeltaResult as { finalText?: string }).finalText !== "hello world") {
+  throw new Error(
+    `expected updated-delta final text hello world, saw ${(updatedDeltaResult as { finalText?: string }).finalText}`,
+  );
+}
+if (updatedDeltaPartials.join("|") !== "hello|hello world") {
+  throw new Error(
+    `expected updated-delta partials hello|hello world, saw ${updatedDeltaPartials.join("|")}`,
   );
 }
 

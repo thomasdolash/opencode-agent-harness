@@ -133,6 +133,19 @@ These checks have passed against the live gateway/WebUI:
 - second-turn session continuity works
 - `/reset` clears prior session context
 - basic file operations and command execution work through the harnessed agent
+- a real `openclaw agent --agent opencode` probe reaches the native harness path
+
+Recent live probe findings:
+
+- the current live route required `--thinking off`; `low` was rejected for the
+  active model
+- the `opencode` route completed a real first turn and preserved session
+  continuity on the same session key
+- the earlier file-write probe exposed workspace drift: the live route reported
+  `cwd` under `/home/node/agent-workspaces/...` instead of the caller-provided
+  probe directory
+- that workspace finding is real, but it is not the primary blocker for the
+  streaming investigation
 
 ## 5. What Is Not Done
 
@@ -186,7 +199,29 @@ Current reality:
 - user experience still often feels like "wait for the full message"
 - we have not yet proven that the current partial path maps cleanly onto
   OpenClaw's existing block/preview streaming behavior in a satisfying way
-- Work directory currently not yet set by plugin
+- the first live CLI probe was too file-write-centric and surfaced workspace
+  drift before it answered the streaming question cleanly
+- a dedicated streaming-timing probe now exists so the next live checks can ask
+  the narrower question: do visible reply chunks arrive progressively on the
+  real `opencode` route
+
+Confirmed streaming findings worth preserving:
+
+- the real OpenCode server event stream is healthy and emits incremental
+  `message.part.delta` text events for assistant output
+- the OpenClaw default agent already streams acceptably in the same WebUI, so
+  the remaining problem is harness-local rather than a blanket gateway/UI
+  failure
+- an earlier harness bug pushed too much emphasis onto block-lane theories, but
+  the current live code no longer mirrors every partial into `onBlockReply`
+- the sharper live bug was assistant-message identification: OpenCode can emit
+  a user `message.part.updated` before assistant text starts, and the harness
+  must not treat that user prompt snapshot as assistant partial output
+- the current harness now tracks known assistant message ids before accepting
+  `message.part.updated` text as assistant-visible partial text
+- the event surface is still mixed across `message.part.updated`,
+  `message.part.delta`, and `session.next.text.*`, so streaming brittleness is
+  reduced but not fully eliminated
 
 So streaming is not absent, but it is not yet a validated strong part of v1 UX.
 
@@ -214,6 +249,11 @@ These are real quirks observed so far.
   instead of always obeying OpenClaw's existing reasoning visibility controls
 - partial reply behavior is still weaker than ideal and can feel too close to
   final-only delivery
+- the current live `opencode` route appears to prefer a gateway-managed
+  workspace path under `/home/node/agent-workspaces/...` rather than the caller
+  probe directory
+- the currently active live model only accepted `thinking off` during probe
+  runs
 
 
 
@@ -305,9 +345,10 @@ Detailed research and implementation planning now live in:
 - align OpenCode reasoning/thinking output with OpenClaw's reasoning visibility
   controls so hidden reasoning stays hidden and visible reasoning uses the
   expected OpenClaw delivery shape
-- map the current partial path more deliberately onto OpenClaw block streaming
-  and preview-streaming behavior so users get progressive output instead of
-  mostly final-only waits
+- simplify the mixed event projector once the compatibility floor is better
+  understood so assistant partials come from the narrowest reliable surface
+- keep block-lane delivery host-owned; do not reintroduce per-delta synthetic
+  block replies while chasing streaming fixes
 
 ### Larger follow-up work that is valid but intentionally deferred
 

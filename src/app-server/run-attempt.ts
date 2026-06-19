@@ -321,16 +321,35 @@ export async function runOpenCodeHarnessAttempt(
     const requestPayload = {
       parts: [{ type: "text", text: promptText }],
     };
+    const streamMessage = client.streamMessage;
+    const supportsStreaming = Boolean(
+      streamMessage &&
+        (params.onPartialReply ||
+          params.onReasoningStream ||
+          params.onReasoningEnd ||
+          params.onAssistantMessageStart ||
+          params.onAgentEvent ||
+          params.onBlockReply ||
+          params.onBlockReplyFlush),
+    );
     opts.logger?.debug?.("starting native turn", {
-      partialStreaming: Boolean(params.onPartialReply && client.streamMessage),
+      partialStreaming: supportsStreaming,
       promptLength: promptText.length,
       sessionFile,
     });
     const response =
-      params.onPartialReply && client.streamMessage
-        ? await client.streamMessage(openCodeSessionId, requestPayload, {
+      supportsStreaming
+        ? await streamMessage!(openCodeSessionId, requestPayload, {
             abortSignal: params.abortSignal,
+            timeoutMs: params.timeoutMs,
+            reasoningLevel: params.reasoningLevel,
             onAssistantMessageStart: async () => {
+              await params.onAgentEvent?.({
+                stream: "assistant",
+                data: {
+                  phase: "start",
+                },
+              });
               await params.onAssistantMessageStart?.();
             },
             onToolEvent: async (payload) => {
@@ -344,10 +363,50 @@ export async function runOpenCodeHarnessAttempt(
               });
             },
             onPartialText: (payload) =>
-              params.onPartialReply?.({
+              Promise.all([
+                params.onPartialReply?.({
+                  text: payload.text,
+                  ...(payload.delta ? { delta: payload.delta } : {}),
+                }),
+                params.onAgentEvent?.({
+                  stream: "assistant",
+                  data: {
+                    text: payload.text,
+                    ...(payload.delta ? { delta: payload.delta } : {}),
+                  },
+                }),
+              ]).then(() => undefined),
+            onReasoningStream: (payload) =>
+              Promise.all([
+                params.onReasoningStream?.({
+                  text: payload.text,
+                  ...(payload.delta ? { delta: payload.delta } : {}),
+                }),
+                params.onAgentEvent?.({
+                  stream: "reasoning",
+                  data: {
+                    text: payload.text,
+                    ...(payload.delta ? { delta: payload.delta } : {}),
+                  },
+                }),
+              ]).then(() => undefined),
+            onReasoningEnd: async () => {
+              await params.onReasoningEnd?.();
+              await params.onAgentEvent?.({
+                stream: "reasoning",
+                data: {
+                  phase: "end",
+                },
+              });
+            },
+            onBlockReply: (payload) =>
+              params.onBlockReply?.({
                 text: payload.text,
-                ...(payload.delta ? { delta: payload.delta } : {}),
+                ...(payload.mediaUrls ? { mediaUrls: payload.mediaUrls } : {}),
               }),
+            onBlockReplyFlush: async () => {
+              await params.onBlockReplyFlush?.();
+            },
           }, requestContext)
         : await client.message(openCodeSessionId, requestPayload, requestContext);
     const turnEnvelope = readTurnEnvelope(response);

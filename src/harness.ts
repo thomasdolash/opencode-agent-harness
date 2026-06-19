@@ -22,7 +22,9 @@ export function createOpenCodeAgentHarness(options?: {
   logger?: OpenCodeHarnessLogger;
 }): AgentHarness {
   const providerIds = new Set(
-    [...(options?.providerIds ?? ["opencode"])].map((id) => id.trim().toLowerCase()),
+    [...(options?.providerIds ?? ["opencode"])]
+      .map((id) => id.trim().toLowerCase())
+      .filter(Boolean),
   );
 
   return {
@@ -30,7 +32,7 @@ export function createOpenCodeAgentHarness(options?: {
     label: options?.label ?? "OpenCode native agent harness",
     contextEngineHostCapabilities: OPENCODE_HARNESS_HOST_CAPABILITIES,
     deliveryDefaults: {
-      sourceVisibleReplies: "message_tool",
+      sourceVisibleReplies: "automatic",
     },
     supports(ctx) {
       const requestedRuntime = (ctx.requestedRuntime ?? "").trim().toLowerCase();
@@ -42,9 +44,15 @@ export function createOpenCodeAgentHarness(options?: {
       if (providerIds.has(provider)) {
         return { supported: true, priority: 100 };
       }
+
+      const supportedProviders = [...providerIds].toSorted();
+      const providerReason = supportedProviders.length
+        ? `provider is not one of: ${supportedProviders.join(", ")}`
+        : "no provider ids are configured";
+
       return {
         supported: false,
-        reason: `requested runtime is not opencode and provider is not one of: ${[...providerIds].toSorted().join(", ")}`,
+        reason: `requested runtime is not opencode and ${providerReason}`,
       };
     },
     runAttempt: async (params) => {
@@ -55,13 +63,16 @@ export function createOpenCodeAgentHarness(options?: {
       });
     },
     reset: async (params) => {
-      if (params.sessionFile) {
-        const { clearOpenCodeHarnessBinding } = await import("./app-server/session-binding.js");
-        await clearOpenCodeHarnessBinding(params.sessionFile);
-        options?.logger?.debug?.("cleared native session binding", {
-          sessionFile: params.sessionFile,
-        });
+      if (!params.sessionFile) {
+        return;
       }
+
+      const { clearOpenCodeHarnessBinding } = await import("./app-server/session-binding.js");
+      await clearOpenCodeHarnessBinding(params.sessionFile);
+
+      options?.logger?.debug?.("cleared native session binding", {
+        sessionFile: params.sessionFile,
+      });
     },
     dispose: async () => {
       const { clearSharedOpenCodeHarnessClientAndWait } = await import("./app-server/shared-client.js");

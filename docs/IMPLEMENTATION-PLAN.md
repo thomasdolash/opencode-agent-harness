@@ -132,6 +132,16 @@ Relevant local reference:
 - manual live test can read/write in the expected project root without relying
   on implicit server defaults
 
+### Latest live finding
+
+The first real `openclaw agent --agent opencode` file-write probe did not land
+in the caller-provided probe directory. The reply reported `cwd` under a
+gateway-managed workspace path (`/home/node/agent-workspaces/...`) instead.
+
+That is a real workspace-propagation signal, but it should stay secondary to
+the primary streaming investigation unless it blocks a narrower streaming-only
+prompt.
+
 ## 4. Reasoning Visibility Integration
 
 ### Gap
@@ -441,18 +451,22 @@ Current smoke covers:
 ### Plan
 
 1. Keep the no-Vitest short-term convention.
-2. Add one more narrow smoke script or expand the current one to cover:
-   streamed partial reply path
-   reasoning part suppression from visible final text
-   directory propagation into client calls
-   usage extraction from a fake `step.ended` event or fake response
-3. Add a tiny manual live checklist doc:
+2. Keep the local smoke focused on harness seams, but use the live probe for
+   the primary UX question: does the real `opencode` route emit progressive
+   visible reply chunks.
+3. The live probe should measure streaming first:
+   run a long no-tool turn
+   record stdout chunk timing
+   report whether multiple visible chunks arrived over time
+4. Treat workspace drift as a captured finding, not the primary pass/fail gate
+   for the streaming probe.
+5. Add a tiny manual live checklist doc:
    first turn
    second turn
    `/reset`
    streamed visible reply
    reasoning off
-4. Do not broaden into slow integration infrastructure until these narrow checks
+6. Do not broaden into slow integration infrastructure until these narrow checks
    stop buying us enough confidence.
 
 ## 9. Deferred But Legitimate Follow-Up Work
@@ -677,3 +691,135 @@ If work resumes immediately, the best sequence is:
 
 That sequence improves the live experience without forcing us to solve the
 hardest host-API gap first.
+
+## 12. Research Handoff For The Next Session
+
+This section captures the concrete findings from the most recent source
+inspection so the next session can move straight into implementation.
+
+### Confirmed OpenCode surface
+
+The OpenCode SDK exposes more than the harness uses today. The methods that
+matter most here are:
+
+- `session.create`
+- `session.prompt`
+- `session.message`
+- `session.promptAsync`
+- `session.messages`
+- `session.command`
+- `session.shell`
+- `session.abort`
+- `session.revert`
+- `session.unrevert`
+- `event.subscribe`
+
+The current harness is already using the right core path for native turns:
+subscribe to SSE, prompt asynchronously, then fetch messages for finalization if
+needed.
+
+### Confirmed OpenClaw surface
+
+OpenClaw already has the delivery lanes we need:
+
+- `onPartialReply`
+- `onAssistantMessageStart`
+- `onReasoningStream`
+- `onReasoningEnd`
+- `onBlockReply`
+- `onBlockReplyFlush`
+- `onAgentEvent`
+- `blockReplyBreak`
+- `blockReplyChunking`
+
+The OpenClaw embedded subscriber also already treats assistant text, reasoning,
+and block delivery as separate concerns. So the task is integration, not
+invention.
+
+### Confirmed Codex reference pattern
+
+The Codex extension is the best local model for a fuller harness.
+
+The big lessons from it are:
+
+- assistant text and reasoning are tracked separately
+- tool progress is projected separately
+- visible delivery is coordinated through OpenClaw, not dumped straight out of
+  the model wrapper
+- its harness defaults to `sourceVisibleReplies: "message_tool"`
+
+That makes Codex the right reference when we want to expand OpenCode beyond the
+thin MVP shape.
+
+### What the latest live behavior suggests
+
+The harness changes already proved that:
+
+- OpenCode sessions can be created and resumed
+- the real `openclaw agent --agent opencode` path can reach the harness
+- a same-session follow-up turn can recall prior-turn state
+- the currently active live model required `thinking off` for the probe route
+
+The remaining streaming problem is therefore likely one of:
+
+- reasoning visibility not being bridged as a first-class host signal
+- the UI consuming the final block lane instead of the progressive assistant
+  lane
+- the CLI/gateway path buffering visible output until turn completion
+- the harness still relying on a mixed event projector that merges
+  `message.part.updated`, `message.part.delta`, and `session.next.text.*`
+  instead of one narrow canonical assistant-text surface
+
+A separate live finding also appeared:
+
+- the file-write probe reported `cwd` under `/home/node/agent-workspaces/...`
+  instead of the caller-supplied probe directory
+
+That workspace finding matters, but it should not dominate the next probe. The
+next probe should be judged first on whether progressive visible output is
+observed on the real route.
+
+Report comparison notes that should stay attached to the plan:
+
+- the external research report was directionally correct that the issue is
+  harness-local and that OpenClaw preview streaming should own progressive
+  delivery
+- the report's strongest old block-lane claim is now stale for this repo: the
+  live code no longer mirrors every partial text update into `onBlockReply`
+- the more precise live bug was assistant-message identification: OpenCode can
+  emit a user `message.part.updated` before assistant output begins, so the
+  harness must filter assistant partials by known assistant message ids
+- the current code now includes that assistant-id guard, which means future
+  streaming investigation should focus less on replaying old block-lane fixes
+  and more on whether the mixed event surface still causes partial buffering or
+  duplication
+- the healthy baseline remains: raw OpenCode SSE emits incremental assistant
+  deltas, so if WebUI still shows a final wall of text, the remaining fault is
+  between the harness projector and OpenClaw's progressive delivery path
+
+The main caution is that `thinkLevel` is not the same thing as reasoning
+visibility. If the next change conflates those, we will keep chasing the wrong
+problem.
+
+### Best next implementation chunks
+
+1. Map OpenCode reasoning events into OpenClaw reasoning callbacks without
+   leaking them into visible assistant text.
+2. Verify live OpenClaw stream/block settings before blaming the SDK bridge.
+3. Add a small event-projector layer only if direct forwarding still does not
+   give enough control.
+4. Keep the harness narrow; do not broaden into provider/tool/permission bridge
+   work unless a concrete gap forces it.
+
+### Useful logs to watch
+
+When the harness is behaving well, logs should show:
+
+- OpenCode session creation or resumption
+- assistant start before final completion
+- repeated assistant deltas while the model is thinking/typing
+- separate tool lifecycle events when tools are used
+- no reasoning text leaking into the normal visible answer
+
+If the UI still prints a wall of text, inspect the OpenClaw delivery path and
+channel config before changing the OpenCode wrapper again.

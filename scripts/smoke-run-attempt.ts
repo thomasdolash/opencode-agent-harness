@@ -25,7 +25,12 @@ const messageCalls: Array<{
   context?: { directory?: string; workspace?: string };
 }> = [];
 const streamedPartials: string[] = [];
+const streamedBlocks: string[] = [];
+let streamedBlockFlushes = 0;
+const streamedAssistantEvents: string[] = [];
+const streamedReasoningEvents: string[] = [];
 const streamedToolPhases: string[] = [];
+const streamedTimeouts: number[] = [];
 let managedServerStarts = 0;
 let managedServerStops = 0;
 const managedClientBaseUrls: string[] = [];
@@ -57,7 +62,13 @@ const fakeClient = {
     _sessionId: string,
     _payload: unknown,
     opts?: {
+      timeoutMs?: number;
+      reasoningLevel?: string;
       onPartialText?: (payload: { text: string; delta?: string }) => void | Promise<void>;
+      onReasoningStream?: (payload: { text: string; delta?: string }) => void | Promise<void>;
+      onReasoningEnd?: () => void | Promise<void>;
+      onBlockReply?: (payload: { text?: string; mediaUrls?: string[] }) => void | Promise<void>;
+      onBlockReplyFlush?: () => void | Promise<void>;
       onAssistantMessageStart?: () => void | Promise<void>;
       onToolEvent?: (payload: {
         phase: "started" | "progress" | "completed" | "failed";
@@ -66,15 +77,28 @@ const fakeClient = {
       }) => void | Promise<void>;
     },
   ) {
+    streamedTimeouts.push(opts?.timeoutMs ?? -1);
     await opts?.onAssistantMessageStart?.();
+    await opts?.onReasoningStream?.({ text: "internal reasoning", delta: "internal reasoning" });
     await opts?.onToolEvent?.({ phase: "started", toolName: "read_file", toolCallId: "tool-1" });
     streamedToolPhases.push("started:read_file");
     await opts?.onPartialText?.({ text: "reply", delta: "reply" });
+    await opts?.onBlockReply?.({ text: "reply" });
     streamedPartials.push("reply");
+    streamedBlocks.push("reply");
     await opts?.onToolEvent?.({ phase: "completed", toolName: "read_file", toolCallId: "tool-1" });
+    await opts?.onBlockReplyFlush?.();
+    streamedBlockFlushes += 1;
     streamedToolPhases.push("completed:read_file");
+    await opts?.onReasoningStream?.({
+      text: "internal reasoning should stay hidden",
+      delta: " should stay hidden",
+    });
+    await opts?.onReasoningEnd?.();
     await opts?.onPartialText?.({ text: "reply-2", delta: "-2" });
+    await opts?.onBlockReply?.({ text: "reply-2" });
     streamedPartials.push("reply-2");
+    streamedBlocks.push("reply-2");
     return {
       response: {
         parts: [{ type: "text", text: "reply-2" }],
@@ -108,6 +132,7 @@ function makeParams(prompt: string): EmbeddedRunAttemptParams {
     authProfileStore: { version: 1, profiles: {} },
     modelRegistry: {} as EmbeddedRunAttemptParams["modelRegistry"],
     thinkLevel: "medium",
+    reasoningLevel: "stream",
     timeoutMs: 5_000,
     disableTools: true,
     abortSignal: new AbortController().signal,
@@ -119,6 +144,22 @@ function makeStreamingParams(prompt: string): EmbeddedRunAttemptParams {
     ...makeParams(prompt),
     onPartialReply: (payload) => {
       streamedPartials.push(payload.text ?? "");
+    },
+    onAgentEvent: (evt) => {
+      if (evt.stream === "reasoning") {
+        const data = evt.data as { text?: string; delta?: string; phase?: string } | undefined;
+        streamedReasoningEvents.push(
+          [data?.phase ?? "", data?.text ?? data?.delta ?? ""].filter(Boolean).join(":"),
+        );
+        return;
+      }
+      if (evt.stream !== "assistant") {
+        return;
+      }
+      const data = evt.data as { text?: string; delta?: string; phase?: string } | undefined;
+      streamedAssistantEvents.push(
+        [data?.phase ?? "", data?.text ?? data?.delta ?? ""].filter(Boolean).join(":"),
+      );
     },
   };
 }
@@ -216,6 +257,10 @@ if (secondResult.assistantTexts.join("\n") !== "reply-2") {
 }
 
 streamedPartials.length = 0;
+streamedBlocks.length = 0;
+streamedBlockFlushes = 0;
+streamedAssistantEvents.length = 0;
+streamedReasoningEvents.length = 0;
 streamedToolPhases.length = 0;
 const streamedResult = await runOpenCodeHarnessAttempt(makeStreamingParams("streamed prompt"), opts);
 if (streamedResult.assistantTexts.join("\n") !== "reply-2") {
@@ -223,6 +268,25 @@ if (streamedResult.assistantTexts.join("\n") !== "reply-2") {
 }
 if (streamedPartials.join("|") !== "reply|reply|reply-2|reply-2") {
   throw new Error(`expected streamed partial trace reply|reply|reply-2|reply-2, saw ${streamedPartials.join("|")}`);
+}
+if (streamedBlocks.join("|") !== "reply|reply-2") {
+  throw new Error(`expected streamed block trace reply|reply-2, saw ${streamedBlocks.join("|")}`);
+}
+if (streamedAssistantEvents.join("|") !== "start|reply|reply-2") {
+  throw new Error(
+    `expected streamed assistant events start|reply|reply-2, saw ${streamedAssistantEvents.join("|")}`,
+  );
+}
+if (
+  streamedReasoningEvents.join("|") !==
+  "internal reasoning|internal reasoning should stay hidden|end"
+) {
+  throw new Error(
+    `expected streamed reasoning events internal reasoning|internal reasoning should stay hidden|end, saw ${streamedReasoningEvents.join("|")}`,
+  );
+}
+if (streamedBlockFlushes !== 1) {
+  throw new Error(`expected streamed block flush count 1, saw ${streamedBlockFlushes}`);
 }
 if (streamedToolPhases.join("|") !== "started:read_file|completed:read_file") {
   throw new Error(`expected streamed tool phases started:read_file|completed:read_file, saw ${streamedToolPhases.join("|")}`);
@@ -235,6 +299,9 @@ if (streamedResult.attemptUsage?.total !== 18) {
 }
 if (streamedResult.lastAssistant?.usage?.totalTokens !== 18) {
   throw new Error(`expected streamed lastAssistant totalTokens 18, saw ${streamedResult.lastAssistant?.usage?.totalTokens}`);
+}
+if (streamedTimeouts[0] !== 5_000) {
+  throw new Error(`expected streamed timeout passthrough 5000, saw ${streamedTimeouts[0]}`);
 }
 
 await clearOpenCodeHarnessBinding(sessionFile);
@@ -559,6 +626,259 @@ if ((delayedAssistantResult as { finalText?: string }).finalText !== "visible re
 }
 if (delayedMessagePolls < 3) {
   throw new Error(`expected delayed assistant polling to continue past placeholder, saw ${delayedMessagePolls} polls`);
+}
+
+await clearSharedOpenCodeHarnessClientAndWait();
+const deltaStreamPartials: string[] = [];
+let deltaStreamAssistantStarts = 0;
+const deltaStreamClient = await createSharedOpenCodeHarnessClient({
+  pluginConfig: {
+    server: {
+      mode: "remote",
+      baseUrl: "http://unused-for-smoke.test",
+    },
+  },
+  sdkClientFactory: async () => ({
+    health: async () => ({ ok: true, version: "2026.6.8" }),
+    session: {
+      create: fakeClient.createSession,
+      promptAsync: async () => {},
+      messages: async () => [
+        {
+          info: {
+            id: "assistant-delta",
+            role: "assistant",
+            time: { created: Date.now() },
+          },
+          parts: [{ type: "text", text: "hello world" }],
+        },
+      ],
+      abort: async () => fakeClient.abort(),
+    },
+    event: {
+      subscribe: async () => ({
+        stream: (async function* () {
+          yield {
+            directory: tempRoot,
+            payload: {
+              type: "message.part.delta",
+              properties: {
+                sessionID: "open-code-session-delta",
+                messageID: "assistant-delta",
+                partID: "part-1",
+                field: "text",
+                delta: "hello",
+              },
+            },
+          };
+          yield {
+            directory: tempRoot,
+            payload: {
+              type: "message.part.delta",
+              properties: {
+                sessionID: "open-code-session-delta",
+                messageID: "assistant-delta",
+                partID: "part-1",
+                field: "text",
+                delta: " world",
+              },
+            },
+          };
+          yield {
+            directory: tempRoot,
+            payload: {
+              type: "session.idle",
+              properties: {
+                sessionID: "open-code-session-delta",
+              },
+            },
+          };
+        })(),
+      }),
+    },
+  }),
+});
+const deltaStreamResult = await deltaStreamClient.streamMessage?.(
+  "open-code-session-delta",
+  { parts: [{ type: "text", text: "stream from deltas" }] },
+  {
+    onAssistantMessageStart: async () => {
+      deltaStreamAssistantStarts += 1;
+    },
+    onPartialText: async (payload) => {
+      deltaStreamPartials.push(payload.text);
+    },
+  },
+  { directory: tempRoot },
+);
+if (!deltaStreamResult || typeof deltaStreamResult !== "object") {
+  throw new Error("expected delta stream client result");
+}
+if ((deltaStreamResult as { finalText?: string }).finalText !== "hello world") {
+  throw new Error(
+    `expected delta stream final text hello world, saw ${(deltaStreamResult as { finalText?: string }).finalText}`,
+  );
+}
+if (deltaStreamAssistantStarts !== 1) {
+  throw new Error(`expected one delta-stream assistant start, saw ${deltaStreamAssistantStarts}`);
+}
+if (deltaStreamPartials.join("|") !== "hello|hello world") {
+  throw new Error(`expected delta stream partials hello|hello world, saw ${deltaStreamPartials.join("|")}`);
+}
+
+await clearSharedOpenCodeHarnessClientAndWait();
+const orderedEventPartials: string[] = [];
+const orderedEventClient = await createSharedOpenCodeHarnessClient({
+  pluginConfig: {
+    server: {
+      mode: "remote",
+      baseUrl: "http://unused-for-smoke.test",
+    },
+  },
+  sdkClientFactory: async () => ({
+    health: async () => ({ ok: true, version: "2026.6.8" }),
+    session: {
+      create: fakeClient.createSession,
+      promptAsync: async () => {},
+      messages: async () => [
+        {
+          info: {
+            id: "user-ordered",
+            role: "user",
+            time: { created: Date.now() },
+          },
+          parts: [{ type: "text", text: "Say hello in five words." }],
+        },
+        {
+          info: {
+            id: "assistant-ordered",
+            role: "assistant",
+            time: { created: Date.now() + 1 },
+          },
+          parts: [{ type: "text", text: "hello world" }],
+        },
+      ],
+      abort: async () => fakeClient.abort(),
+    },
+    event: {
+      subscribe: async () => ({
+        stream: (async function* () {
+          yield {
+            directory: tempRoot,
+            payload: {
+              type: "message.updated",
+              properties: {
+                info: {
+                  id: "user-ordered",
+                  role: "user",
+                  sessionID: "open-code-session-ordered",
+                },
+              },
+            },
+          };
+          yield {
+            directory: tempRoot,
+            payload: {
+              type: "message.part.updated",
+              properties: {
+                part: {
+                  messageID: "user-ordered",
+                  type: "text",
+                  text: "Say hello in five words.",
+                  sessionID: "open-code-session-ordered",
+                },
+              },
+            },
+          };
+          yield {
+            directory: tempRoot,
+            payload: {
+              type: "message.updated",
+              properties: {
+                info: {
+                  id: "assistant-ordered",
+                  role: "assistant",
+                  sessionID: "open-code-session-ordered",
+                },
+              },
+            },
+          };
+          yield {
+            directory: tempRoot,
+            payload: {
+              type: "message.part.updated",
+              properties: {
+                part: {
+                  messageID: "assistant-ordered",
+                  type: "text",
+                  text: "",
+                  sessionID: "open-code-session-ordered",
+                },
+              },
+            },
+          };
+          yield {
+            directory: tempRoot,
+            payload: {
+              type: "message.part.delta",
+              properties: {
+                sessionID: "open-code-session-ordered",
+                messageID: "assistant-ordered",
+                partID: "part-ordered",
+                field: "text",
+                delta: "hello",
+              },
+            },
+          };
+          yield {
+            directory: tempRoot,
+            payload: {
+              type: "message.part.delta",
+              properties: {
+                sessionID: "open-code-session-ordered",
+                messageID: "assistant-ordered",
+                partID: "part-ordered",
+                field: "text",
+                delta: " world",
+              },
+            },
+          };
+          yield {
+            directory: tempRoot,
+            payload: {
+              type: "session.idle",
+              properties: {
+                sessionID: "open-code-session-ordered",
+              },
+            },
+          };
+        })(),
+      }),
+    },
+  }),
+});
+const orderedEventResult = await orderedEventClient.streamMessage?.(
+  "open-code-session-ordered",
+  { parts: [{ type: "text", text: "stream only assistant text" }] },
+  {
+    onPartialText: async (payload) => {
+      orderedEventPartials.push(payload.text);
+    },
+  },
+  { directory: tempRoot },
+);
+if (!orderedEventResult || typeof orderedEventResult !== "object") {
+  throw new Error("expected ordered-event stream client result");
+}
+if ((orderedEventResult as { finalText?: string }).finalText !== "hello world") {
+  throw new Error(
+    `expected ordered-event final text hello world, saw ${(orderedEventResult as { finalText?: string }).finalText}`,
+  );
+}
+if (orderedEventPartials.join("|") !== "hello|hello world") {
+  throw new Error(
+    `expected ordered-event partials hello|hello world, saw ${orderedEventPartials.join("|")}`,
+  );
 }
 
 console.log("opencode-agent-harness smoke OK");

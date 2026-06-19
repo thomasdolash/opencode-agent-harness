@@ -49,7 +49,13 @@ export type OpenCodeHarnessClient = {
     payload: unknown,
     opts?: {
       abortSignal?: AbortSignal;
+      timeoutMs?: number;
+      reasoningLevel?: "off" | "on" | "stream" | string;
       onPartialText?: (payload: { text: string; delta?: string }) => void | Promise<void>;
+      onReasoningStream?: (payload: { text: string; delta?: string }) => void | Promise<void>;
+      onReasoningEnd?: () => void | Promise<void>;
+      onBlockReply?: (payload: { text?: string; mediaUrls?: string[] }) => void | Promise<void>;
+      onBlockReplyFlush?: () => void | Promise<void>;
       onAssistantMessageStart?: () => void | Promise<void>;
       onToolEvent?: (payload: {
         phase: "started" | "progress" | "completed" | "failed";
@@ -227,6 +233,13 @@ function hasCompletedAssistantState(message: unknown): boolean {
   );
 }
 
+function resolveTurnWaitTimeoutMs(timeoutMs: number | undefined): number {
+  if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return 60_000;
+  }
+  return timeoutMs;
+}
+
 function isAbortLikeError(error: unknown): boolean {
   if (!error || typeof error !== "object") {
     return false;
@@ -285,6 +298,26 @@ async function waitForAssistantMessage(params: {
   return fallbackAssistant ?? {
     parts: params.partialText ? [{ type: "text", text: params.partialText }] : [],
   };
+}
+
+async function waitForTurnStreamToSettle(params: {
+  isTurnFinished: () => boolean;
+  getLastEventAt: () => number;
+  quietWindowMs?: number;
+  timeoutMs?: number;
+}): Promise<void> {
+  const quietWindowMs = params.quietWindowMs ?? 150;
+  const timeoutMs = params.timeoutMs ?? 2_000;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (params.isTurnFinished()) {
+      return;
+    }
+    if (Date.now() - params.getLastEventAt() >= quietWindowMs) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
 }
 
 export function resolveHarnessPluginConfig(
@@ -402,16 +435,21 @@ export async function createSharedOpenCodeHarnessClient(opts: {
       }
 
       let targetAssistantMessageId: string | undefined;
+      const knownAssistantMessageIds = new Set<string>();
       let partialText = "";
       let reasoningText = "";
+      let lastReasoningText = "";
       let sawPromptActivity = false;
       let sessionError: string | undefined;
       let assistantStarted = false;
       let turnFinished = false;
+      const reasoningEnabled = opts?.reasoningLevel !== "off";
       const toolMetas = new Map<string, OpenCodeHarnessTurnToolMeta>();
       let usage: OpenCodeHarnessUsage | undefined;
       const query = resolveQueryContext(context);
       const turnStartedAt = Date.now();
+      const turnWaitTimeoutMs = resolveTurnWaitTimeoutMs(opts?.timeoutMs);
+      let lastEventAt = turnStartedAt;
 
       try {
         const subscription = await client.event.subscribe({
@@ -430,11 +468,16 @@ export async function createSharedOpenCodeHarnessClient(opts: {
             if (!eventType || !properties) {
               continue;
             }
+            lastEventAt = Date.now();
 
             if (eventType === "message.updated") {
               const info = readRecord(properties.info);
               if (info?.sessionID === sessionId && info.role === "assistant") {
-                targetAssistantMessageId = readString(info.id) ?? targetAssistantMessageId;
+                const assistantMessageId = readString(info.id);
+                if (assistantMessageId) {
+                  knownAssistantMessageIds.add(assistantMessageId);
+                  targetAssistantMessageId = assistantMessageId;
+                }
                 sawPromptActivity = true;
               }
               continue;
@@ -448,20 +491,38 @@ export async function createSharedOpenCodeHarnessClient(opts: {
 
               const messageId = readString(part.messageID);
               const partType = readString(part.type);
-              if (!targetAssistantMessageId && messageId && (partType === "text" || partType === "reasoning")) {
+              if (!messageId || !knownAssistantMessageIds.has(messageId)) {
+                continue;
+              }
+              if (!targetAssistantMessageId) {
                 targetAssistantMessageId = messageId;
               }
-              if (!messageId || !targetAssistantMessageId || messageId !== targetAssistantMessageId) {
+              if (messageId !== targetAssistantMessageId) {
                 continue;
               }
 
               sawPromptActivity = true;
+              const nextText = readString(part.text) ?? "";
+              if (partType === "reasoning") {
+                reasoningText = nextText;
+                if (reasoningEnabled) {
+                  const delta =
+                    lastReasoningText && nextText.startsWith(lastReasoningText)
+                      ? nextText.slice(lastReasoningText.length)
+                      : nextText;
+                  lastReasoningText = nextText;
+                  await opts?.onReasoningStream?.({
+                    text: reasoningText,
+                    ...(delta ? { delta } : {}),
+                  });
+                }
+                continue;
+              }
               if (partType !== "text") {
                 continue;
               }
 
               const delta = readString(properties.delta);
-              const nextText = readString(part.text) ?? "";
               if (!nextText) {
                 continue;
               }
@@ -470,6 +531,40 @@ export async function createSharedOpenCodeHarnessClient(opts: {
               await opts?.onPartialText?.({
                 text: partialText,
                 ...(delta ? { delta } : {}),
+              });
+              continue;
+            }
+
+            if (eventType === "message.part.delta" && properties.sessionID === sessionId) {
+              const field = readString(properties.field);
+              const messageId = readString(properties.messageID);
+              const delta = readString(properties.delta);
+              if (field !== "text" || !messageId || !delta) {
+                continue;
+              }
+
+              if (!knownAssistantMessageIds.has(messageId)) {
+                if (knownAssistantMessageIds.size > 0) {
+                  continue;
+                }
+                knownAssistantMessageIds.add(messageId);
+              }
+              if (!targetAssistantMessageId) {
+                targetAssistantMessageId = messageId;
+              }
+              if (messageId !== targetAssistantMessageId) {
+                continue;
+              }
+
+              sawPromptActivity = true;
+              if (!assistantStarted) {
+                assistantStarted = true;
+                await opts?.onAssistantMessageStart?.();
+              }
+              partialText += delta;
+              await opts?.onPartialText?.({
+                text: partialText,
+                delta,
               });
               continue;
             }
@@ -523,6 +618,12 @@ export async function createSharedOpenCodeHarnessClient(opts: {
               }
               sawPromptActivity = true;
               reasoningText += delta;
+              if (reasoningEnabled) {
+                await opts?.onReasoningStream?.({
+                  text: reasoningText,
+                  delta,
+                });
+              }
               continue;
             }
 
@@ -533,6 +634,13 @@ export async function createSharedOpenCodeHarnessClient(opts: {
               }
               sawPromptActivity = true;
               reasoningText = text;
+              if (reasoningEnabled) {
+                lastReasoningText = text;
+                await opts?.onReasoningStream?.({
+                  text: reasoningText,
+                });
+                await opts?.onReasoningEnd?.();
+              }
               continue;
             }
 
@@ -543,6 +651,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
                 continue;
               }
               sawPromptActivity = true;
+              await opts?.onBlockReplyFlush?.();
               toolMetas.set(toolCallId, { toolName });
               await opts?.onToolEvent?.({
                 phase: "started",
@@ -609,10 +718,11 @@ export async function createSharedOpenCodeHarnessClient(opts: {
                   total:
                     (readNumber(tokens.input) ?? 0) +
                     (readNumber(tokens.output) ?? 0) +
-                    (readNumber(tokens.reasoning) ?? 0),
+                  (readNumber(tokens.reasoning) ?? 0),
                 };
               }
               sawPromptActivity = true;
+              await opts?.onBlockReplyFlush?.();
               turnFinished = true;
               break;
             }
@@ -624,6 +734,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
                 "unknown OpenCode session error";
               sessionError = errorMessage;
               sawPromptActivity = true;
+              await opts?.onBlockReplyFlush?.();
               turnFinished = true;
               break;
             }
@@ -635,6 +746,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
                   properties.sessionID === sessionId &&
                   readRecord(properties.status)?.type === "idle"))
             ) {
+              await opts?.onBlockReplyFlush?.();
               turnFinished = true;
               break;
             }
@@ -660,10 +772,14 @@ export async function createSharedOpenCodeHarnessClient(opts: {
           partialText,
           earliestCreatedAt: turnStartedAt,
           isTurnFinished: () => turnFinished,
-          timeoutMs: 15_000,
+          timeoutMs: turnWaitTimeoutMs,
         });
 
         if (!turnFinished) {
+          await waitForTurnStreamToSettle({
+            isTurnFinished: () => turnFinished,
+            getLastEventAt: () => lastEventAt,
+          });
           streamAbort.abort();
           void consumeEvents.catch(() => undefined);
         } else {

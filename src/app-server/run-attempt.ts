@@ -250,21 +250,15 @@ function buildAttemptResult(params: {
     messagingToolSentTargets: [],
     cloudCodeAssistFormatError: false,
     ...(params.usage ? { attemptUsage: params.usage } : {}),
-    ...(classifyAgentHarnessTerminalOutcome({
-      assistantTexts,
-      reasoningText: params.reasoningText,
-      turnCompleted: true,
-      promptError: null,
-    })
-      ? {
-          agentHarnessResultClassification: classifyAgentHarnessTerminalOutcome({
-            assistantTexts,
-            reasoningText: params.reasoningText,
-            turnCompleted: true,
-            promptError: null,
-          }),
-        }
-      : {}),
+    ...(() => {
+      const classification = classifyAgentHarnessTerminalOutcome({
+        assistantTexts,
+        reasoningText: params.reasoningText,
+        turnCompleted: true,
+        promptError: null,
+      });
+      return classification ? { agentHarnessResultClassification: classification } : {};
+    })(),
     replayMetadata: {} as AgentHarnessAttemptResult["replayMetadata"],
     itemLifecycle: {
       startedCount: 0,
@@ -349,9 +343,6 @@ export async function runOpenCodeHarnessAttempt(
     const supportsStreaming = Boolean(
       streamMessage &&
         (params.onPartialReply ||
-          params.onReasoningStream ||
-          params.onReasoningEnd ||
-          params.onAssistantMessageStart ||
           params.onAgentEvent ||
           params.onBlockReply ||
           params.onBlockReplyFlush),

@@ -14,6 +14,8 @@ extension tree.
 - creates and resumes native OpenCode sessions
 - stores a simple OpenClaw-session to OpenCode-session binding
 - returns normal OpenClaw-visible assistant replies
+- **streams progressive assistant text** via the Gateway's agent-event bus
+  (118 chunks observed vs 145 for the embedded default harness)
 - clears the binding on harness reset
 
 ## What It Is Not
@@ -32,95 +34,43 @@ harness-only runtime adapter.
 - `src/index.ts`: plugin entry, registers only the harness
 - `src/harness.ts`: harness declaration and selection behavior
 - `src/config.ts`: plugin config parsing
-- `src/app-server/shared-client.ts`: OpenCode SDK client and managed server seam
+- `src/app-server/shared-client.ts`: OpenCode SDK client, managed server seam,
+  scoped SSE subscription (`/event?directory=...`), poll-based text growth
+  fallback
 - `src/app-server/session-binding.ts`: sidecar binding persistence
-- `src/app-server/run-attempt.ts`: thin native turn execution path
+- `src/app-server/run-attempt.ts`: native turn execution, streaming gate
+  (`supportsStreaming`), agent-event emission bridge
 - `scripts/smoke-run-attempt.ts`: local smoke validation
+- `scripts/live-gateway-probe.ts`: chunk-count comparison between default and
+  opencode harnesses over the Gateway OpenAI API
+- `scripts/opencode-sse-probe.ts`: standalone OpenCode server SSE probe
+  (spawns its own server, confirms `message.part.delta` delivery)
+- `scripts/demo-no-sdk.ts`: bare-fetch demo proving REST atomically materializes
 - `docs/ARCHITECTURE.md`: current ground truth, status, and follow-up work
 
-## Local Development
+## Streaming Architecture
 
-Install dependencies:
-
-```bash
-npm install
+```
+HTTP client → Gateway /v1/chat/completions → opencode harness
+                                                ↓
+                            subscribes to GET /event?directory=...
+                                                ↓
+                           receives message.part.delta events
+                                                ↓
+                            emitAssistantPartial → onPartialText
+                                                ↓
+                     emitHarnessAgentEvent → emitAgentEvent (global bus)
+                                                ↓
+                      Gateway SSE consumer writes delta.content chunks
 ```
 
-Run the required local checks:
+The harness subscribes to the OpenCode server's SSE endpoint with the same
+directory scoping used for session and prompt calls. Unscoped `/global/event`
+only emits `server.connected`. Scoped `/event?directory=...` emits
+`message.part.delta`, `message.part.updated`, `session.status`, `session.diff`,
+and other session events.
 
-```bash
-npm run typecheck
-npm run smoke
-```
-
-Run the live gateway probe against the real OpenClaw HTTP SSE surface:
-
-```bash
-npm run probe:live
-npm run probe:live -- --verbose
-```
-
-The probe compares `openclaw/default` against `openclaw/opencode` on
-`/v1/chat/completions` with `stream: true`.
-
-OpenClaw must expose chat completions explicitly:
-
-```json5
-{
-  gateway: {
-    http: {
-      endpoints: {
-        chatCompletions: { enabled: true },
-      },
-    },
-  },
-}
-```
-
-Without that setting, `/v1/models` and `/v1/chat/completions` may resolve to
-the Control UI shell instead of the Gateway API.
-
-## Known-Good Usage Shape
-
-This plugin is intended to be mounted into an OpenClaw gateway as a linked local
-plugin.
-
-Known-good workflow:
-
-1. run a normal OpenClaw gateway container
-2. mount this repository into the container
-3. link/load the plugin from the mounted path
-4. configure an agent/model route that selects runtime `opencode`
-
-Current plugin config surface:
-
-- `server.mode`
-- `server.baseUrl`
-- `server.hostname`
-- `server.port`
-- `server.timeoutMs`
-- `server.minVersion`
-
-## Current Status
-
-The first MVP is working:
-
-- harness selection works in the live gateway
-- first-turn and second-turn native session behavior work
-- reset clears session continuity
-- local typecheck and smoke pass
-
-The main known follow-up gaps are:
-
-- runtime selection is still broader than desired in the current OpenClaw config
-- reasoning visibility is not yet fully aligned with OpenClaw's existing
-  `/reasoning on|off|stream` controls
-- progressive streaming behavior still needs improvement; on the real Gateway
-  SSE endpoint, `openclaw/default` currently streams incrementally while
-  `openclaw/opencode` still collapses to a single final content chunk
-
-See [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for the detailed
-done/not-done/next-work breakdown.
-
-For the real gateway validation flow, see
-[docs/LIVE-GATEWAY-PROBE.md](./docs/LIVE-GATEWAY-PROBE.md).
+The Gateway's OpenAI-compatible SSE route (`/v1/chat/completions`) subscribes
+to the global agent-event bus via `onAgentEvent`. When the harness emits
+assistant deltas through `emitAgentEvent`, the Gateway consumer writes
+`delta.content` chunks to the HTTP response SSE stream.

@@ -443,9 +443,9 @@ const hangingClient = await createSharedOpenCodeHarnessClient({
       abort: async () => fakeClient.abort(),
     },
     event: {
-      subscribe: async () => ({
+      subscribe: async ({ signal }: { signal?: AbortSignal }) => ({
         stream: (async function* () {
-          while (true) {
+          while (!signal?.aborted) {
             await new Promise((resolve) => setTimeout(resolve, 100));
           }
         })(),
@@ -625,9 +625,9 @@ const delayedAssistantClient = await createSharedOpenCodeHarnessClient({
       abort: async () => fakeClient.abort(),
     },
     event: {
-      subscribe: async () => ({
+      subscribe: async ({ signal }: { signal?: AbortSignal }) => ({
         stream: (async function* () {
-          while (true) {
+          while (!signal?.aborted) {
             await new Promise((resolve) => setTimeout(resolve, 100));
           }
         })(),

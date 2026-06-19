@@ -58,14 +58,17 @@ Current core files:
 - `src/app-server/session-binding.ts`
 - `src/app-server/run-attempt.ts`
 - `scripts/smoke-run-attempt.ts`
+- `scripts/live-gateway-probe.ts`
+- `scripts/opencode-sse-probe.ts`
+- `scripts/demo-no-sdk.ts`
 
 Current plugin behavior:
 
 - `src/index.ts` registers only an agent harness
-- `src/harness.ts` exposes harness id `opencode`
-- `src/app-server/shared-client.ts` owns OpenCode SDK wiring
+- `src/harness.ts` exposes harness id `opencode` with `deliveryDefaults.sourceVisibleReplies: "automatic"`
+- `src/app-server/shared-client.ts` owns OpenCode SDK wiring, scoped SSE subscription, poll fallback
 - `src/app-server/session-binding.ts` owns sidecar persistence
-- `src/app-server/run-attempt.ts` owns the thin turn execution path
+- `src/app-server/run-attempt.ts` owns the turn execution path with streaming gate via `supportsStreaming`
 
 ## 3. Deployment Shape That Is Known Good
 
@@ -84,6 +87,7 @@ Current OpenClaw-side reality:
 - the plugin is visible in startup logs
 - the harness is selected for the `opencode` agent path
 - the WebUI can use it successfully for live turns
+- `/v1/chat/completions` streaming works with progressive chunks
 
 ## 4. What Is Done
 
@@ -117,7 +121,24 @@ The following is complete and proven working.
 - a turn can create a native OpenCode session
 - a later turn can resume that session
 - final assistant text is returned to OpenClaw in a valid harness result shape
-- partial reply support exists as best-effort streaming
+- streaming delivers progressive assistant text via the Gateway agent-event bus
+
+### Streaming (progressive assistant text)
+
+Progressive SSE streaming is now working end-to-end:
+
+- the harness subscribes to the OpenCode server's scoped SSE endpoint
+  (`/event?directory=...`) which delivers `message.part.delta` events
+- unscoped `/global/event` only emits `server.connected` and is not used
+- `supportsStreaming` gates on `onPartialReply`, `onAgentEvent`, or block
+  callbacks — whichever the Gateway provides
+- assistant deltas are emitted to the Gateway's global agent-event bus via
+  `emitAgentEvent`, which the `/v1/chat/completions` SSE consumer reads
+- a live probe measured 118 progressive chunks for `openclaw/opencode`
+  vs 145 for `openclaw/default` baseline
+- a synchronous dispatch pattern avoids stalling the SSE event loop on
+  callback resolution
+- a poll-based text growth fallback runs concurrently in case SSE is silent
 
 ### Validation
 
@@ -134,18 +155,8 @@ These checks have passed against the live gateway/WebUI:
 - `/reset` clears prior session context
 - basic file operations and command execution work through the harnessed agent
 - a real `openclaw agent --agent opencode` probe reaches the native harness path
-
-Recent live probe findings:
-
-- the current live route required `--thinking off`; `low` was rejected for the
-  active model
-- the `opencode` route completed a real first turn and preserved session
-  continuity on the same session key
-- the earlier file-write probe exposed workspace drift: the live route reported
-  `cwd` under `/home/node/agent-workspaces/...` instead of the caller-provided
-  probe directory
-- that workspace finding is real, but it is not the primary blocker for the
-  streaming investigation
+- `openclaw/opencode` streams progressively through `/v1/chat/completions`
+  (118 chunks, chunk-level timing comparable to the default harness)
 
 ## 5. What Is Not Done
 
@@ -184,51 +195,6 @@ Current reality:
 This means the current implementation is functionally working but not yet fully
 aligned with OpenClaw's existing reasoning controls.
 
-### Streaming behavior
-
-OpenClaw already distinguishes between:
-
-- reasoning visibility streaming
-- block streaming for channel delivery
-- preview streaming for supported channels
-
-Current reality:
-
-- the harness can return a correct final reply
-- best-effort partial support exists in the code path
-- user experience still often feels like "wait for the full message"
-- we have not yet proven that the current partial path maps cleanly onto
-  OpenClaw's existing block/preview streaming behavior in a satisfying way
-- the first live CLI probe was too file-write-centric and surfaced workspace
-  drift before it answered the streaming question cleanly
-- a dedicated streaming-timing probe now exists so the next live checks can ask
-  the narrower question: do visible reply chunks arrive progressively on the
-  real `opencode` route
-
-Confirmed streaming findings worth preserving:
-
-- the real OpenCode server event stream is healthy and emits incremental
-  `message.part.delta` text events for assistant output
-- the OpenClaw default agent already streams acceptably in the same WebUI, so
-  the remaining problem is harness-local rather than a blanket gateway/UI
-  failure
-- once `gateway.http.endpoints.chatCompletions.enabled` was turned on, the same
-  pattern reproduced on the documented Gateway SSE endpoint:
-  `openclaw/default` streamed incrementally while `openclaw/opencode` collapsed
-  to one final content chunk
-- an earlier harness bug pushed too much emphasis onto block-lane theories, but
-  the current live code no longer mirrors every partial into `onBlockReply`
-- the sharper live bug was assistant-message identification: OpenCode can emit
-  a user `message.part.updated` before assistant text starts, and the harness
-  must not treat that user prompt snapshot as assistant partial output
-- the current harness now tracks known assistant message ids before accepting
-  `message.part.updated` text as assistant-visible partial text
-- the event surface is still mixed across `message.part.updated`,
-  `message.part.delta`, and `session.next.text.*`, so streaming brittleness is
-  reduced but not fully eliminated
-
-So streaming is not absent, but it is not yet a validated strong part of v1 UX.
-
 ### Safety/policy integration
 
 - no permission-bridge layer between OpenCode and OpenClaw
@@ -251,15 +217,11 @@ These are real quirks observed so far.
 - runtime selection currently depends on a broader config hammer than we want (not fully tested)
 - reasoning/thinking text can currently surface more directly than desired
   instead of always obeying OpenClaw's existing reasoning visibility controls
-- partial reply behavior is still weaker than ideal and can feel too close to
-  final-only delivery
 - the current live `opencode` route appears to prefer a gateway-managed
   workspace path under `/home/node/agent-workspaces/...` rather than the caller
   probe directory
 - the currently active live model only accepted `thinking off` during probe
   runs
-
-
 
 ## 7. Current Testing Convention
 
@@ -294,6 +256,7 @@ Definition satisfied in practice:
 - reset clears state
 - harness path is usable from the OpenClaw WebUI
 - provider and harness responsibilities remain separate
+- progressive SSE streaming works through `/v1/chat/completions`
 
 This is no longer a theory or scaffolding exercise.
 
@@ -308,8 +271,6 @@ obvious gaps are:
 - improve diagnostics around session creation and session reuse failures
 - route reasoning/thinking visibility through OpenClaw's existing
   `/reasoning on|off|stream` expectations instead of leaking raw thought text
-- make progressive delivery feel more like real OpenClaw streaming and less
-  like full-message wait mode
 
 ## 10. What Could Be Done Next
 
@@ -349,10 +310,6 @@ Detailed research and implementation planning now live in:
 - align OpenCode reasoning/thinking output with OpenClaw's reasoning visibility
   controls so hidden reasoning stays hidden and visible reasoning uses the
   expected OpenClaw delivery shape
-- simplify the mixed event projector once the compatibility floor is better
-  understood so assistant partials come from the narrowest reliable surface
-- keep block-lane delivery host-owned; do not reintroduce per-delta synthetic
-  block replies while chasing streaming fixes
 
 ### Larger follow-up work that is valid but intentionally deferred
 
@@ -378,7 +335,8 @@ These remain out of scope for the current working baseline:
 ## 12. Bottom Line
 
 This repository now contains a real, working first implementation of an
-OpenCode native agent harness for OpenClaw WebUI use.
+OpenCode native agent harness for OpenClaw WebUI use, including progressive
+SSE streaming.
 
 The most important thing to preserve is the narrow shape:
 
@@ -387,6 +345,7 @@ The most important thing to preserve is the narrow shape:
 - small runtime modules
 - real session continuity
 - real reset behavior
+- real progressive streaming
 - no speculative platform sprawl
 
 Future work should improve this baseline, not bury it.

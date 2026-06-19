@@ -156,6 +156,31 @@ function resolveQueryContext(
   };
 }
 
+async function subscribeToOpenCodeEvents(
+  client: any,
+  params: {
+    signal: AbortSignal;
+    query?: Record<string, string>;
+  },
+): Promise<{ stream: AsyncIterable<unknown> }> {
+  const subscribe = client?.event?.subscribe;
+  if (typeof subscribe === "function") {
+    const urlParams = params.query
+      ? { directory: params.query.directory, workspace: params.query.workspace }
+      : undefined;
+    return await subscribe.call(client.event, urlParams ? { query: urlParams, signal: params.signal } : { signal: params.signal });
+  }
+
+  const globalEvent = client?.global?.event;
+  if (typeof globalEvent === "function") {
+    return await globalEvent.call(client.global, {
+      signal: params.signal,
+    });
+  }
+
+  throw new Error("OpenCode SDK does not expose a supported event subscription method");
+}
+
 function unwrapSdkData<T = unknown>(value: T): unknown {
   const record = readRecord(value);
   if (record && "data" in record && record.data !== undefined) {
@@ -280,8 +305,8 @@ function resolveTurnWaitTimeoutMs(timeoutMs: number | undefined): number {
 }
 
 function isStreamDebugEnabled(): boolean {
-  const raw = process.env.OPENCODE_HARNESS_STREAM_DEBUG?.trim().toLowerCase();
-  return raw === "1" || raw === "true" || raw == "yes";
+  const level = process.env.OPENCLAW_LOG_LEVEL?.trim().toLowerCase();
+  return level === "debug" || level === "trace";
 }
 
 function isAbortLikeError(error: unknown): boolean {
@@ -480,6 +505,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
 
       let targetAssistantMessageId: string | undefined;
       const knownAssistantMessageIds = new Set<string>();
+      const knownUserMessageIds = new Set<string>();
       let partialText = "";
       let reasoningText = "";
       const streamDebug = isStreamDebugEnabled();
@@ -510,7 +536,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
         return messageId;
       };
 
-      const emitAssistantStart = async () => {
+      const emitAssistantStart = () => {
         if (assistantStarted) {
           debugStreamEvent('skipping assistant start', {
             reason: 'already-started',
@@ -521,10 +547,10 @@ export async function createSharedOpenCodeHarnessClient(opts: {
         debugStreamEvent('emitting assistant start', {
           targetAssistantMessageId,
         });
-        await opts?.onAssistantMessageStart?.();
+        opts?.onAssistantMessageStart?.();
       };
 
-      const emitAssistantPartial = async (nextText: string, explicitDelta?: string) => {
+      const emitAssistantPartial = (nextText: string, explicitDelta?: string) => {
         const previousText = partialText;
         const resolvedText = resolveNextPartialText(partialText, nextText, explicitDelta);
         if (!resolvedText) {
@@ -533,6 +559,14 @@ export async function createSharedOpenCodeHarnessClient(opts: {
             previousLength: previousText.length,
             nextLength: nextText.length,
             explicitDeltaLength: explicitDelta?.length ?? 0,
+          });
+          return;
+        }
+        if (previousText && resolvedText.length < previousText.length) {
+          debugStreamEvent('skipping regression', {
+            reason: 'text-shrunk',
+            previousLength: previousText.length,
+            resolvedLength: resolvedText.length,
           });
           return;
         }
@@ -546,8 +580,11 @@ export async function createSharedOpenCodeHarnessClient(opts: {
           resolvedDeltaLength: resolvedDelta?.length ?? 0,
           targetAssistantMessageId,
         });
-        await emitAssistantStart();
-        await opts?.onPartialText?.({
+        if (!assistantStarted) {
+          assistantStarted = true;
+          opts?.onAssistantMessageStart?.();
+        }
+        opts?.onPartialText?.({
           text: partialText,
           ...(resolvedDelta ? { delta: resolvedDelta } : {}),
         });
@@ -561,13 +598,15 @@ export async function createSharedOpenCodeHarnessClient(opts: {
       const toolMetas = new Map<string, OpenCodeHarnessTurnToolMeta>();
       let usage: OpenCodeHarnessUsage | undefined;
       const query = resolveQueryContext(context);
+      debugStreamEvent('event subscription location', { query });
       const turnStartedAt = Date.now();
       const turnWaitTimeoutMs = resolveTurnWaitTimeoutMs(opts?.timeoutMs);
       let lastEventAt = turnStartedAt;
 
       try {
-        const subscription = await client.event.subscribe({
+        const subscription = await subscribeToOpenCodeEvents(client, {
           signal: streamAbort.signal,
+          query,
         });
 
         const consumeEvents = (async () => {
@@ -589,9 +628,17 @@ export async function createSharedOpenCodeHarnessClient(opts: {
 
             if (eventType === "message.updated") {
               const info = readRecord(properties.info);
-              if (readSessionId(info) === sessionId && info?.role === "assistant") {
+              if (readSessionId(info) !== sessionId) {
+                continue;
+              }
+              if (info?.role === "assistant") {
                 noteAssistantMessageId(readMessageId(info));
                 sawPromptActivity = true;
+              } else {
+                const messageId = readMessageId(info);
+                if (messageId) {
+                  knownUserMessageIds.add(messageId);
+                }
               }
               continue;
             }
@@ -604,14 +651,31 @@ export async function createSharedOpenCodeHarnessClient(opts: {
 
               const messageId = readMessageId(part);
               const partType = readString(part.type);
-              if (!messageId || !knownAssistantMessageIds.has(messageId)) {
+              if (!messageId) {
                 debugStreamEvent('skipping message.part.updated', {
-                  reason: !messageId ? 'missing-message-id' : 'unknown-assistant-message-id',
-                  messageId,
+                  reason: 'missing-message-id',
                   partType,
-                  knownAssistantMessageCount: knownAssistantMessageIds.size,
                 });
                 continue;
+              }
+              if (knownUserMessageIds.has(messageId)) {
+                debugStreamEvent('skipping user message.part.updated', {
+                  messageId,
+                  partType,
+                });
+                continue;
+              }
+              if (!knownAssistantMessageIds.has(messageId)) {
+                if (knownAssistantMessageIds.size > 0) {
+                  debugStreamEvent('skipping message.part.updated', {
+                    reason: 'unknown-assistant-message-id',
+                    messageId,
+                    partType,
+                    knownAssistantMessageCount: knownAssistantMessageIds.size,
+                  });
+                  continue;
+                }
+                noteAssistantMessageId(messageId);
               }
               targetAssistantMessageId ??= messageId;
               if (messageId !== targetAssistantMessageId) {
@@ -642,7 +706,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
                 continue;
               }
 
-              await emitAssistantPartial(nextText, readString(properties.delta));
+              emitAssistantPartial(nextText, readString(properties.delta));
               continue;
             }
 
@@ -681,14 +745,14 @@ export async function createSharedOpenCodeHarnessClient(opts: {
                 deltaLength: delta.length,
                 partialLengthBefore: partialText.length,
               });
-              await emitAssistantPartial(`${partialText}${delta}`, delta);
+              emitAssistantPartial(`${partialText}${delta}`, delta);
               continue;
             }
 
             if (eventType === "session.next.text.started" && readSessionId(properties) === sessionId) {
               noteAssistantMessageId(readAssistantMessageId(properties));
               sawPromptActivity = true;
-              await emitAssistantStart();
+              emitAssistantStart();
               continue;
             }
 
@@ -706,7 +770,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
                 deltaLength: delta.length,
                 partialLengthBefore: partialText.length,
               });
-              await emitAssistantPartial(`${partialText}${delta}`, delta);
+              emitAssistantPartial(`${partialText}${delta}`, delta);
               continue;
             }
 
@@ -723,7 +787,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
               debugStreamEvent('accepting session.next.text.ended', {
                 textLength: text.length,
               });
-              await emitAssistantPartial(text);
+              emitAssistantPartial(text);
               continue;
             }
 
@@ -875,6 +939,32 @@ export async function createSharedOpenCodeHarnessClient(opts: {
           ...(query ? { query } : {}),
         });
 
+        const pollForTextGrowth = (async () => {
+          const pollIntervalMs = 200;
+          let lastPolledText = "";
+          while (!turnFinished && !streamAbort.signal.aborted) {
+            await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+            if (turnFinished) break;
+            try {
+              const messages = unwrapSdkData(await client.session.messages({
+                path: { id: sessionId },
+                query: {
+                  limit: 5,
+                  ...(query ?? {}),
+                },
+              }));
+              const latest = selectLatestAssistantMessage(messages, targetAssistantMessageId, turnStartedAt);
+              const latestText = extractAssistantText(latest);
+              if (latestText && latestText.length > lastPolledText.length) {
+                lastPolledText = latestText;
+                emitAssistantPartial(latestText);
+              }
+            } catch {
+              // best-effort polling, ignore errors
+            }
+          }
+        })();
+
         const response = await waitForAssistantMessage({
           fetchMessages: async () =>
             unwrapSdkData(await client.session.messages({
@@ -897,7 +987,12 @@ export async function createSharedOpenCodeHarnessClient(opts: {
             getLastEventAt: () => lastEventAt,
           });
           streamAbort.abort();
-          void consumeEvents.catch(() => undefined);
+          void consumeEvents.catch((err) => {
+            opts?.logger?.error?.("stream consume error after turn finished", {
+              error: String(err),
+            });
+          });
+          void pollForTextGrowth.catch(() => undefined);
         } else {
           try {
             await consumeEvents;

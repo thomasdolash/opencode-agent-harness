@@ -53,6 +53,13 @@ npm run typecheck
 npm run smoke
 ```
 
+Run the live gateway probe against a real OpenClaw -> OpenCode route:
+
+```bash
+npm run probe:live
+npm run probe:live -- --agent opencode
+```
+
 ## Known-Good Usage Shape
 
 This plugin is intended to be mounted into an OpenClaw gateway as a linked local
@@ -92,3 +99,6 @@ The main known follow-up gaps are:
 
 See [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for the detailed
 done/not-done/next-work breakdown.
+
+For the real gateway validation flow, see
+[docs/LIVE-GATEWAY-PROBE.md](./docs/LIVE-GATEWAY-PROBE.md).

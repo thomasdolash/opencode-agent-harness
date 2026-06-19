@@ -12,7 +12,8 @@
   "scripts": {
     "build": "tsc -p ./tsconfig.json",
     "typecheck": "tsc -p ./tsconfig.json --noEmit",
-    "smoke": "node --import tsx ./scripts/smoke-run-attempt.ts"
+    "smoke": "node --import tsx ./scripts/smoke-run-attempt.ts",
+    "probe:live": "node --import tsx ./scripts/live-gateway-probe.ts"
   },
   "dependencies": {
     "@opencode-ai/sdk": "*"
@@ -21,13 +22,15 @@
     "openclaw": ">=2026.6.8"
   },
   "devDependencies": {
-    "@types/node": "^22.15.30",
+    "@types/node": "^22.19.21",
     "openclaw": "^2026.6.8",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3"
   },
   "openclaw": {
-    "extensions": ["./src/index.ts"],
+    "extensions": [
+      "./src/index.ts"
+    ],
     "compat": {
       "pluginApi": ">=2026.6.8",
       "minGatewayVersion": "2026.6.8"

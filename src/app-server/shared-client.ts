@@ -505,6 +505,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
 
       const acceptedAssistantMessageIds = new Set<string>();
       const knownUserMessageIds = new Set<string>();
+      const partTypesByPartId = new Map<string, string>();
       let partialText = "";
       let reasoningText = "";
       const streamDebug = isStreamDebugEnabled();
@@ -662,6 +663,10 @@ export async function createSharedOpenCodeHarnessClient(opts: {
                 });
                 continue;
               }
+              const partId = readString(properties.partID) ?? readString(part.id) ?? readString((part as Record<string, unknown>).partID as string) ?? messageId;
+              if (partId && partType) {
+                partTypesByPartId.set(partId, partType);
+              }
               if (knownUserMessageIds.has(messageId)) {
                 debugStreamEvent('skipping user message.part.updated', {
                   messageId,
@@ -709,6 +714,16 @@ export async function createSharedOpenCodeHarnessClient(opts: {
               const messageId = readMessageId(properties);
               const delta = readString(properties.delta);
               if (field !== "text" || !messageId || !delta) {
+                continue;
+              }
+
+              const partId = readString(properties.partID) ?? messageId;
+              const knownPartType = partTypesByPartId.get(partId);
+              if (knownPartType === "reasoning") {
+                reasoningText += delta;
+                if (reasoningLevel === "stream") {
+                  await opts?.onReasoningStream?.({ text: reasoningText, delta });
+                }
                 continue;
               }
 

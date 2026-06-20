@@ -80,9 +80,10 @@ export function buildOpenCodeAssistantResponseMessage(
   modelId: string | undefined,
   timestamp: number,
   reasoningText?: string,
+  reasoningLevel?: string,
 ): AgentMessage {
   const content: Array<{ type: string; text?: string; thinking?: string }> = [{ type: "text", text: finalText }];
-  if (reasoningText) {
+  if (reasoningText && reasoningLevel !== "off") {
     content.push({ type: "thinking", thinking: reasoningText });
   }
   const msg: Record<string, unknown> = {

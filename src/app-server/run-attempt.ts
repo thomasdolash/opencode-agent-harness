@@ -206,17 +206,21 @@ function buildAttemptResult(params: {
   promptText: string;
   finalText: string;
   reasoningText?: string;
+  reasoningLevel?: string;
   toolMetas?: AgentHarnessAttemptResult["toolMetas"];
   usage?: OpenCodeHarnessUsage;
 }): AgentHarnessAttemptResult {
   const assistantTexts = params.finalText ? [params.finalText] : [];
   const usageSnapshot = buildUsageSnapshot(params.usage);
+  const suppressReasoning = params.reasoningLevel === "off";
   const assistantMessage = params.finalText
     ? ({
         role: "assistant",
         content: [
           { type: "text", text: params.finalText },
-          ...(params.reasoningText ? [{ type: "thinking" as const, thinking: params.reasoningText }] : []),
+          ...(!suppressReasoning && params.reasoningText
+            ? [{ type: "thinking" as const, thinking: params.reasoningText }]
+            : []),
         ],
         provider: params.provider,
         model: params.modelId,
@@ -491,6 +495,7 @@ export async function runOpenCodeHarnessAttempt(
           params.modelId,
           Date.now(),
           reasoningText,
+          params.reasoningLevel,
         ),
       ],
       logger: opts.logger,
@@ -516,6 +521,7 @@ export async function runOpenCodeHarnessAttempt(
       promptText,
       finalText,
       reasoningText,
+      reasoningLevel: params.reasoningLevel,
       toolMetas: turnEnvelope?.toolMetas as AgentHarnessAttemptResult["toolMetas"] | undefined,
       usage: turnEnvelope?.usage,
     });

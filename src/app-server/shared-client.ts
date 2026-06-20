@@ -503,12 +503,12 @@ export async function createSharedOpenCodeHarnessClient(opts: {
         }
       }
 
-      let targetAssistantMessageId: string | undefined;
-      const knownAssistantMessageIds = new Set<string>();
+      const acceptedAssistantMessageIds = new Set<string>();
       const knownUserMessageIds = new Set<string>();
       let partialText = "";
       let reasoningText = "";
       const streamDebug = isStreamDebugEnabled();
+      
 
       const debugStreamEvent = (message: string, meta?: Record<string, unknown>) => {
         if (!streamDebug) {
@@ -520,18 +520,24 @@ export async function createSharedOpenCodeHarnessClient(opts: {
         });
       };
 
-      const noteAssistantMessageId = (messageId: string | undefined): string | undefined => {
+      const acceptAssistantMessageId = (messageId: string | undefined): string | undefined => {
         if (!messageId) {
           return undefined;
         }
-        knownAssistantMessageIds.add(messageId);
-        const previousTarget = targetAssistantMessageId;
-        targetAssistantMessageId ??= messageId;
-        debugStreamEvent('observed assistant message id', {
+        if (acceptedAssistantMessageIds.has(messageId)) {
+          return messageId;
+        }
+        if (acceptedAssistantMessageIds.size > 0) {
+          debugStreamEvent('additional assistant message id', {
+            messageId,
+            acceptedCount: acceptedAssistantMessageIds.size + 1,
+            knownMessageIds: [...acceptedAssistantMessageIds, messageId].join(','),
+          });
+        }
+        acceptedAssistantMessageIds.add(messageId);
+        debugStreamEvent('accepted assistant message id', {
           messageId,
-          previousTargetAssistantMessageId: previousTarget,
-          targetAssistantMessageId,
-          knownAssistantMessageCount: knownAssistantMessageIds.size,
+          acceptedAssistantMessageCount: acceptedAssistantMessageIds.size,
         });
         return messageId;
       };
@@ -544,9 +550,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
           return;
         }
         assistantStarted = true;
-        debugStreamEvent('emitting assistant start', {
-          targetAssistantMessageId,
-        });
+        debugStreamEvent('emitting assistant start');
         opts?.onAssistantMessageStart?.();
       };
 
@@ -578,7 +582,6 @@ export async function createSharedOpenCodeHarnessClient(opts: {
           resolvedLength: resolvedText.length,
           explicitDeltaLength: explicitDelta?.length ?? 0,
           resolvedDeltaLength: resolvedDelta?.length ?? 0,
-          targetAssistantMessageId,
         });
         if (!assistantStarted) {
           assistantStarted = true;
@@ -633,7 +636,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
                 continue;
               }
               if (info?.role === "assistant") {
-                noteAssistantMessageId(readMessageId(info));
+                acceptAssistantMessageId(readMessageId(info));
                 sawPromptActivity = true;
               } else {
                 const messageId = readMessageId(info);
@@ -666,27 +669,17 @@ export async function createSharedOpenCodeHarnessClient(opts: {
                 });
                 continue;
               }
-              if (!knownAssistantMessageIds.has(messageId)) {
-                if (knownAssistantMessageIds.size > 0) {
+              if (!acceptedAssistantMessageIds.has(messageId)) {
+                if (acceptedAssistantMessageIds.size > 0) {
                   debugStreamEvent('skipping message.part.updated', {
                     reason: 'unknown-assistant-message-id',
                     messageId,
                     partType,
-                    knownAssistantMessageCount: knownAssistantMessageIds.size,
+                    acceptedAssistantMessageCount: acceptedAssistantMessageIds.size,
                   });
                   continue;
                 }
-                noteAssistantMessageId(messageId);
-              }
-              targetAssistantMessageId ??= messageId;
-              if (messageId !== targetAssistantMessageId) {
-                debugStreamEvent('skipping message.part.updated', {
-                  reason: 'non-target-assistant-message-id',
-                  messageId,
-                  targetAssistantMessageId,
-                  partType,
-                });
-                continue;
+                acceptAssistantMessageId(messageId);
               }
 
               sawPromptActivity = true;
@@ -719,25 +712,16 @@ export async function createSharedOpenCodeHarnessClient(opts: {
                 continue;
               }
 
-              if (!knownAssistantMessageIds.has(messageId)) {
-                if (knownAssistantMessageIds.size > 0) {
+              if (!acceptedAssistantMessageIds.has(messageId)) {
+                if (acceptedAssistantMessageIds.size > 0) {
                   debugStreamEvent('skipping message.part.delta', {
                     reason: 'unknown-assistant-message-id',
                     messageId,
-                    targetAssistantMessageId,
-                    knownAssistantMessageCount: knownAssistantMessageIds.size,
+                    acceptedAssistantMessageCount: acceptedAssistantMessageIds.size,
                   });
                   continue;
                 }
-                noteAssistantMessageId(messageId);
-              }
-              if (messageId !== targetAssistantMessageId) {
-                debugStreamEvent('skipping message.part.delta', {
-                  reason: 'non-target-assistant-message-id',
-                  messageId,
-                  targetAssistantMessageId,
-                });
-                continue;
+                acceptAssistantMessageId(messageId);
               }
 
               sawPromptActivity = true;
@@ -751,14 +735,14 @@ export async function createSharedOpenCodeHarnessClient(opts: {
             }
 
             if (eventType === "session.next.text.started" && readSessionId(properties) === sessionId) {
-              noteAssistantMessageId(readAssistantMessageId(properties));
+              acceptAssistantMessageId(readAssistantMessageId(properties));
               sawPromptActivity = true;
               emitAssistantStart();
               continue;
             }
 
             if (eventType === "session.next.text.delta" && readSessionId(properties) === sessionId) {
-              noteAssistantMessageId(readAssistantMessageId(properties));
+              acceptAssistantMessageId(readAssistantMessageId(properties));
               sawPromptActivity = true;
               const delta = readString(properties.delta);
               if (!delta) {
@@ -776,7 +760,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
             }
 
             if (eventType === "session.next.text.ended" && readSessionId(properties) === sessionId) {
-              noteAssistantMessageId(readAssistantMessageId(properties));
+              acceptAssistantMessageId(readAssistantMessageId(properties));
               sawPromptActivity = true;
               const text = readString(properties.text);
               if (!text) {
@@ -954,7 +938,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
                   ...(query ?? {}),
                 },
               }));
-              const latest = selectLatestAssistantMessage(messages, targetAssistantMessageId, turnStartedAt);
+              const latest = selectLatestAssistantMessage(messages, undefined, turnStartedAt);
               const latestText = extractAssistantText(latest);
               if (latestText && latestText.length > lastPolledText.length) {
                 lastPolledText = latestText;
@@ -975,7 +959,6 @@ export async function createSharedOpenCodeHarnessClient(opts: {
                 ...(query ?? {}),
               },
             })),
-          preferredMessageId: targetAssistantMessageId,
           partialText,
           earliestCreatedAt: turnStartedAt,
           isTurnFinished: () => turnFinished,
@@ -1008,10 +991,14 @@ export async function createSharedOpenCodeHarnessClient(opts: {
           throw new Error(sessionError);
         }
 
-        const finalText = extractAssistantText(response) || partialText;
+        const responseText = extractAssistantText(response);
+        const finalText = responseText && responseText.length >= partialText.length ? responseText : partialText;
+        const firstAssistantMessageId = acceptedAssistantMessageIds.size > 0
+          ? [...acceptedAssistantMessageIds][0]
+          : undefined;
         return {
           response,
-          ...(targetAssistantMessageId ? { assistantMessageId: targetAssistantMessageId } : {}),
+          ...(firstAssistantMessageId ? { assistantMessageId: firstAssistantMessageId } : {}),
           ...(finalText ? { finalText } : {}),
           ...(reasoningText ? { reasoningText } : {}),
           ...(toolMetas.size > 0 ? { toolMetas: [...toolMetas.values()] } : {}),

@@ -594,7 +594,8 @@ export async function createSharedOpenCodeHarnessClient(opts: {
       let sessionError: string | undefined;
       let assistantStarted = false;
       let turnFinished = false;
-      const reasoningEnabled = opts?.reasoningLevel !== "off";
+      const reasoningLevel: "off" | "on" | "stream" | undefined = opts?.reasoningLevel as any;
+      const reasoningReturnable = true;
       const toolMetas = new Map<string, OpenCodeHarnessTurnToolMeta>();
       let usage: OpenCodeHarnessUsage | undefined;
       const query = resolveQueryContext(context);
@@ -692,7 +693,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
               const nextText = readString(part.text) ?? "";
               if (partType === "reasoning") {
                 reasoningText = nextText;
-                if (reasoningEnabled) {
+                if (reasoningLevel === "stream") {
                   const delta = resolvePartialDelta(lastReasoningText, nextText, readString(properties.delta));
                   lastReasoningText = nextText;
                   await opts?.onReasoningStream?.({
@@ -798,7 +799,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
               }
               sawPromptActivity = true;
               reasoningText += delta;
-              if (reasoningEnabled) {
+              if (reasoningLevel === "stream") {
                 await opts?.onReasoningStream?.({
                   text: reasoningText,
                   delta,
@@ -814,7 +815,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
               }
               sawPromptActivity = true;
               reasoningText = text;
-              if (reasoningEnabled) {
+              if (reasoningLevel === "stream") {
                 lastReasoningText = text;
                 await opts?.onReasoningStream?.({
                   text: reasoningText,

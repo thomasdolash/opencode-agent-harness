@@ -13,6 +13,8 @@
     "build": "tsc -p ./tsconfig.json",
     "typecheck": "tsc -p ./tsconfig.json --noEmit",
     "smoke": "node --import tsx ./scripts/smoke-run-attempt.ts",
+    "probe:reasoning": "node --import tsx ./scripts/reasoning-level-probe.ts",
+    "probe:reasoning-gateway": "node --import tsx ./scripts/reasoning-gateway-probe.ts",
     "probe:live": "node --import tsx ./scripts/live-gateway-probe.ts"
   },
   "dependencies": {

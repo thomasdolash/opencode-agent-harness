@@ -209,7 +209,10 @@ function buildAttemptResult(params: {
   const assistantMessage = params.finalText
     ? ({
         role: "assistant",
-        content: [{ type: "text", text: params.finalText }],
+        content: [
+          { type: "text", text: params.finalText },
+          ...(params.reasoningText ? [{ type: "thinking" as const, thinking: params.reasoningText }] : []),
+        ],
         provider: params.provider,
         model: params.modelId,
         ...(usageSnapshot ? { usage: usageSnapshot } : {}),

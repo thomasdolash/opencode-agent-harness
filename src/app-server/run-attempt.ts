@@ -18,6 +18,11 @@ import {
   readOpenCodeHarnessBinding,
   writeOpenCodeHarnessBinding,
 } from "./session-binding.js";
+import {
+  buildOpenCodeAssistantResponseMessage,
+  buildOpenCodeUserPromptMessage,
+  mirrorOpenCodeAttemptToTranscript,
+} from "./transcript-mirror.js";
 
 function extractPromptText(params: AgentHarnessAttemptParams): string {
   if (typeof params.prompt === "string" && params.prompt.trim() !== "") {
@@ -468,6 +473,35 @@ export async function runOpenCodeHarnessAttempt(
       model: params.modelId,
       createdAt: binding?.createdAt ?? new Date().toISOString(),
     });
+
+    const currentTurnCount = binding?.turnCount ?? 0;
+    await mirrorOpenCodeAttemptToTranscript({
+      sessionFile,
+      agentId: params.agentId,
+      sessionKey: params.sessionKey,
+      sessionId: params.sessionId,
+      cwd: params.cwd ?? params.workspaceDir,
+      config: opts.pluginConfig,
+      turnCount: currentTurnCount,
+      messages: [
+        buildOpenCodeUserPromptMessage(promptText, Date.now(), params.sessionId),
+        buildOpenCodeAssistantResponseMessage(
+          finalText,
+          params.provider,
+          params.modelId,
+          Date.now(),
+          reasoningText,
+        ),
+      ],
+      logger: opts.logger,
+    });
+    await writeOpenCodeHarnessBinding(sessionFile, {
+      openCodeSessionId,
+      model: params.modelId,
+      createdAt: binding?.createdAt ?? new Date().toISOString(),
+      turnCount: currentTurnCount + 1,
+    });
+
     opts.logger?.debug?.("completed native OpenCode turn", {
       finalTextLength: finalText.length,
       hasReasoningText: reasoningText.trim() !== "",

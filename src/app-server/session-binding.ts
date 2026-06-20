@@ -13,6 +13,7 @@ export type OpenCodeHarnessBinding = {
   model?: string;
   createdAt: string;
   updatedAt: string;
+  turnCount?: number;
 };
 
 export function resolveOpenCodeHarnessBindingPath(sessionFile: string): string {
@@ -36,6 +37,7 @@ export async function readOpenCodeHarnessBinding(
       model: typeof parsed.model === "string" ? parsed.model : undefined,
       createdAt: typeof parsed.createdAt === "string" ? parsed.createdAt : new Date().toISOString(),
       updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : new Date().toISOString(),
+      turnCount: typeof parsed.turnCount === "number" && Number.isFinite(parsed.turnCount) ? Math.trunc(parsed.turnCount) : undefined,
     };
   } catch (error: any) {
     if (error?.code === "ENOENT") {
@@ -58,6 +60,7 @@ export async function writeOpenCodeHarnessBinding(
       model: binding.model,
       createdAt: binding.createdAt,
       updatedAt: new Date().toISOString(),
+      turnCount: binding.turnCount,
     };
     await fs.writeFile(path, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
   });

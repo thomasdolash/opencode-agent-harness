@@ -81,22 +81,48 @@ export function buildOpenCodeAssistantResponseMessage(
   timestamp: number,
   reasoningText?: string,
   reasoningLevel?: string,
+  toolCalls?: Array<{ id: string; name: string; arguments: Record<string, unknown> }>,
 ): AgentMessage {
-  const content: Array<{ type: string; text?: string; thinking?: string }> = [{ type: "text", text: finalText }];
+  const content: Array<{ type: string; text?: string; thinking?: string; id?: string; name?: string; arguments?: Record<string, unknown> }> = [];
+  if (finalText) {
+    content.push({ type: "text", text: finalText });
+  }
   if (reasoningText && reasoningLevel !== "off") {
     content.push({ type: "thinking", thinking: reasoningText });
+  }
+  if (toolCalls && toolCalls.length > 0) {
+    for (const tc of toolCalls) {
+      content.push({ type: "toolCall", id: tc.id, name: tc.name, arguments: tc.arguments });
+    }
   }
   const msg: Record<string, unknown> = {
     role: "assistant",
     content,
     provider,
-    stopReason: "stop",
+    stopReason: toolCalls && toolCalls.length > 0 ? "toolUse" : "stop",
     timestamp,
   };
   if (modelId) {
     msg.model = modelId;
   }
   return msg as unknown as AgentMessage;
+}
+
+export function buildOpenCodeToolResultMessage(
+  toolCallId: string,
+  toolName: string,
+  resultText: string,
+  isError: boolean,
+  timestamp: number,
+): AgentMessage {
+  return {
+    role: "toolResult",
+    toolCallId,
+    toolName,
+    content: [{ type: "text", text: resultText }],
+    isError,
+    timestamp,
+  } as unknown as AgentMessage;
 }
 
 export type MirrorOpenCodeAttemptParams = {

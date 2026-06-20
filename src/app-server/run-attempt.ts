@@ -20,6 +20,7 @@ import {
 } from "./session-binding.js";
 import {
   buildOpenCodeAssistantResponseMessage,
+  buildOpenCodeToolResultMessage,
   buildOpenCodeUserPromptMessage,
   mirrorOpenCodeAttemptToTranscript,
 } from "./transcript-mirror.js";
@@ -479,6 +480,13 @@ export async function runOpenCodeHarnessAttempt(
     });
 
     const currentTurnCount = binding?.turnCount ?? 0;
+    const toolParts = turnEnvelope?.toolParts ?? [];
+    const toolCalls = toolParts
+      .filter((t) => !t.isError)
+      .map((t) => ({ id: t.callID, name: t.toolName, arguments: t.input ?? {} }));
+    const toolResultMessages = toolParts.map((t) =>
+      buildOpenCodeToolResultMessage(t.callID, t.toolName, t.result ?? t.error ?? "", t.isError, Date.now()),
+    );
     await mirrorOpenCodeAttemptToTranscript({
       sessionFile,
       agentId: params.agentId,
@@ -496,7 +504,9 @@ export async function runOpenCodeHarnessAttempt(
           Date.now(),
           reasoningText,
           params.reasoningLevel,
+          toolCalls,
         ),
+        ...toolResultMessages,
       ],
       logger: opts.logger,
     });

@@ -116,6 +116,9 @@ const fakeClient = {
       finalText: "reply-2",
       reasoningText: "stream reasoning stays separate",
       toolMetas: [{ toolName: "read_file" }],
+      toolParts: [
+        { callID: "tool-1", toolName: "read_file", input: { path: "/test.txt" }, result: "file content", isError: false },
+      ],
       usage: {
         input: 12,
         output: 4,
@@ -332,6 +335,26 @@ if (streamedToolPhases.join("|") !== "started:read_file|completed:read_file") {
 }
 if (streamedResult.toolMetas[0]?.toolName !== "read_file") {
   throw new Error(`expected streamed tool meta read_file, saw ${streamedResult.toolMetas[0]?.toolName}`);
+}
+const transcriptContent = await fs.readFile(sessionFile, "utf-8");
+const transcriptLines = transcriptContent.split("\n").filter(Boolean);
+const toolCallEntries = transcriptLines.filter((l) => l.includes('"type":"toolCall"'));
+const toolResultEntries = transcriptLines.filter((l) => l.includes('"role":"toolResult"'));
+if (toolCallEntries.length === 0) {
+  throw new Error("expected at least one toolCall entry in transcript");
+}
+if (toolResultEntries.length === 0) {
+  throw new Error("expected at least one toolResult entry in transcript");
+}
+// Verify toolCall references the correct tool name
+const firstToolCall = JSON.parse(toolCallEntries[0]);
+if (firstToolCall.message?.content?.some?.((c: Record<string, unknown>) => c.type === "toolCall" && c.name === "read_file") !== true) {
+  throw new Error("expected toolCall for read_file in transcript");
+}
+// Verify toolResult links back
+const firstToolResult = JSON.parse(toolResultEntries[0]);
+if (firstToolResult.message?.toolCallId !== "tool-1" || firstToolResult.message?.toolName !== "read_file") {
+  throw new Error("expected toolResult for tool-1/read_file in transcript");
 }
 if (streamedResult.attemptUsage?.total !== 18) {
   throw new Error(`expected streamed attempt usage total 18, saw ${streamedResult.attemptUsage?.total}`);

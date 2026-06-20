@@ -19,6 +19,15 @@ export type OpenCodeHarnessTurnToolMeta = {
   meta?: string;
 };
 
+export type OpenCodeHarnessToolPartData = {
+  callID: string;
+  toolName: string;
+  input?: Record<string, unknown>;
+  result?: string;
+  error?: string;
+  isError: boolean;
+};
+
 export type OpenCodeHarnessUsage = {
   input?: number;
   output?: number;
@@ -34,6 +43,7 @@ export type OpenCodeHarnessTurnResult = {
   finalText?: string;
   reasoningText?: string;
   toolMetas?: OpenCodeHarnessTurnToolMeta[];
+  toolParts?: OpenCodeHarnessToolPartData[];
   usage?: OpenCodeHarnessUsage;
 };
 
@@ -117,6 +127,20 @@ function readMessageId(value: unknown): string | undefined {
 function readAssistantMessageId(value: unknown): string | undefined {
   const record = readRecord(value);
   return readString(record?.assistantMessageID) ?? readString(record?.assistantMessageId) ?? readString(record?.assistant_message_id);
+}
+
+function extractTextFromContentArray(contentArray: unknown): string | undefined {
+  const parts = Array.isArray(contentArray) ? contentArray : [];
+  const texts: string[] = [];
+  for (const part of parts) {
+    const rec = readRecord(part);
+    if (!rec) continue;
+    if (rec.type === "text" || !rec.type) {
+      const text = readString(rec.text);
+      if (text) texts.push(text);
+    }
+  }
+  return texts.length > 0 ? texts.join("\n") : undefined;
 }
 
 function resolvePartialDelta(previousText: string, nextText: string, explicitDelta: string | undefined): string | undefined {
@@ -601,6 +625,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
       const reasoningLevel: "off" | "on" | "stream" | undefined = opts?.reasoningLevel as any;
       const reasoningReturnable = true;
       const toolMetas = new Map<string, OpenCodeHarnessTurnToolMeta>();
+      const toolParts = new Map<string, OpenCodeHarnessToolPartData>();
       let usage: OpenCodeHarnessUsage | undefined;
       const query = resolveQueryContext(context);
       debugStreamEvent('event subscription location', { query });
@@ -833,6 +858,8 @@ export async function createSharedOpenCodeHarnessClient(opts: {
               sawPromptActivity = true;
               await opts?.onBlockReplyFlush?.();
               toolMetas.set(toolCallId, { toolName });
+              const input = readRecord(properties.input);
+              toolParts.set(toolCallId, { callID: toolCallId, toolName, input, isError: false });
               await opts?.onToolEvent?.({
                 phase: "started",
                 toolName,
@@ -863,6 +890,12 @@ export async function createSharedOpenCodeHarnessClient(opts: {
                 continue;
               }
               sawPromptActivity = true;
+              const part = toolParts.get(toolCallId);
+              if (part) {
+                const content = readRecord(properties.content);
+                const resultText = readString(properties.result) ?? extractTextFromContentArray(content);
+                toolParts.set(toolCallId, { ...part, result: resultText, isError: false });
+              }
               await opts?.onToolEvent?.({
                 phase: "completed",
                 toolName,
@@ -878,6 +911,11 @@ export async function createSharedOpenCodeHarnessClient(opts: {
                 continue;
               }
               sawPromptActivity = true;
+              const part = toolParts.get(toolCallId);
+              if (part) {
+                const errorText = readString(readRecord(properties.error)?.message) ?? readString(properties.error) ?? "tool failed";
+                toolParts.set(toolCallId, { ...part, error: errorText, isError: true });
+              }
               await opts?.onToolEvent?.({
                 phase: "failed",
                 toolName,
@@ -1017,6 +1055,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
           ...(finalText ? { finalText } : {}),
           ...(reasoningText ? { reasoningText } : {}),
           ...(toolMetas.size > 0 ? { toolMetas: [...toolMetas.values()] } : {}),
+          ...(toolParts.size > 0 ? { toolParts: [...toolParts.values()] } : {}),
           ...(usage ? { usage } : {}),
         } satisfies OpenCodeHarnessTurnResult;
       } finally {

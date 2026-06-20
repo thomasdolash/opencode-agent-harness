@@ -514,7 +514,7 @@ export async function runOpenCodeHarnessAttempt(
       sessionFile,
     });
     return buildAttemptResult({
-      sessionIdUsed: openCodeSessionId,
+      sessionIdUsed: params.sessionId,
       sessionFileUsed: sessionFile,
       provider: params.provider,
       modelId: params.modelId,

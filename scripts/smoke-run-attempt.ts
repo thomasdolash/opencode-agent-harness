@@ -243,6 +243,12 @@ if (firstBinding?.openCodeSessionId !== "open-code-session-1") {
 if (firstResult.assistantTexts.join("\n") !== "reply-1") {
   throw new Error(`expected first assistant text reply-1, saw ${firstResult.assistantTexts.join("\n")}`);
 }
+if (firstResult.sessionIdUsed !== "openclaw-session-1") {
+  throw new Error(`expected first sessionIdUsed openclaw-session-1, saw ${firstResult.sessionIdUsed}`);
+}
+if (firstResult.sessionFileUsed !== sessionFile) {
+  throw new Error(`expected first sessionFileUsed ${sessionFile}, saw ${firstResult.sessionFileUsed}`);
+}
 if ((firstResult.messagesSnapshot[0] as { role?: string }).role !== "user") {
   throw new Error("expected first messagesSnapshot entry to mirror the user prompt");
 }
@@ -264,6 +270,12 @@ if (secondBinding?.openCodeSessionId !== "open-code-session-1") {
 }
 if (secondResult.assistantTexts.join("\n") !== "reply-2") {
   throw new Error(`expected second assistant text reply-2, saw ${secondResult.assistantTexts.join("\n")}`);
+}
+if (secondResult.sessionIdUsed !== "openclaw-session-1") {
+  throw new Error(`expected second sessionIdUsed openclaw-session-1, saw ${secondResult.sessionIdUsed}`);
+}
+if (secondResult.sessionFileUsed !== sessionFile) {
+  throw new Error(`expected second sessionFileUsed ${sessionFile}, saw ${secondResult.sessionFileUsed}`);
 }
 
 streamedPartials.length = 0;

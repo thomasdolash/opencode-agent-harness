@@ -311,6 +311,36 @@ function extractAssistantText(response: unknown): string {
     .trim();
 }
 
+function extractToolPartsFromResponse(response: unknown): OpenCodeHarnessToolPartData[] {
+  if (!response || typeof response !== "object") return [];
+  const record = response as Record<string, unknown>;
+  const parts = [
+    ...(Array.isArray(record.parts) ? record.parts : []),
+    ...(Array.isArray((record.body as Record<string, unknown> | undefined)?.parts)
+      ? ((record.body as Record<string, unknown> | undefined)?.parts as unknown[])
+      : []),
+    ...(Array.isArray((record.data as Record<string, unknown> | undefined)?.parts)
+      ? ((record.data as Record<string, unknown> | undefined)?.parts as unknown[])
+      : []),
+  ];
+  const result: OpenCodeHarnessToolPartData[] = [];
+  for (const part of parts) {
+    const p = readRecord(part);
+    if (!p || p.type !== "tool") continue;
+    const callID = readString(p.callID) ?? readString(p.id) ?? "";
+    const toolName = readString(p.tool) ?? "";
+    if (!callID || !toolName) continue;
+    const state = readRecord(p.state);
+    const input = readRecord(state?.input) as Record<string, unknown> | undefined;
+    if (state?.status === "error") {
+      result.push({ callID, toolName, input, error: readString(state.error) ?? "tool error", isError: true });
+    } else {
+      result.push({ callID, toolName, input, result: readString(state?.output) ?? "", isError: false });
+    }
+  }
+  return result;
+}
+
 function hasCompletedAssistantState(message: unknown): boolean {
   const info = readRecord(readRecord(message)?.info);
   const time = readRecord(info?.time);
@@ -892,8 +922,7 @@ export async function createSharedOpenCodeHarnessClient(opts: {
               sawPromptActivity = true;
               const part = toolParts.get(toolCallId);
               if (part) {
-                const content = readRecord(properties.content);
-                const resultText = readString(properties.result) ?? extractTextFromContentArray(content);
+                const resultText = readString(properties.result) ?? extractTextFromContentArray(properties.content);
                 toolParts.set(toolCallId, { ...part, result: resultText, isError: false });
               }
               await opts?.onToolEvent?.({
@@ -1049,13 +1078,16 @@ export async function createSharedOpenCodeHarnessClient(opts: {
         const firstAssistantMessageId = acceptedAssistantMessageIds.size > 0
           ? [...acceptedAssistantMessageIds][0]
           : undefined;
+        const resolvedToolParts = toolParts.size > 0
+          ? [...toolParts.values()]
+          : extractToolPartsFromResponse(response);
         return {
           response,
           ...(firstAssistantMessageId ? { assistantMessageId: firstAssistantMessageId } : {}),
           ...(finalText ? { finalText } : {}),
           ...(reasoningText ? { reasoningText } : {}),
           ...(toolMetas.size > 0 ? { toolMetas: [...toolMetas.values()] } : {}),
-          ...(toolParts.size > 0 ? { toolParts: [...toolParts.values()] } : {}),
+          ...(resolvedToolParts.length > 0 ? { toolParts: resolvedToolParts } : {}),
           ...(usage ? { usage } : {}),
         } satisfies OpenCodeHarnessTurnResult;
       } finally {

@@ -133,7 +133,17 @@ export async function startNativeToolCallbackServer(host?: string, port?: number
     });
 
     srv.on("error", (err: Error) => {
-      reject(err);
+      if ((err as NodeJS.ErrnoException).code === "EADDRINUSE" && listenPort !== 0) {
+        srv.listen(0, listenHost, () => {
+          const addr = srv.address();
+          const actualPort = typeof addr === "object" && addr ? addr.port : 0;
+          serverUrl = `http://${listenHost}:${actualPort}`;
+          httpServer = srv;
+          resolve(serverUrl);
+        });
+      } else {
+        reject(err);
+      }
     });
 
     srv.listen(listenPort, listenHost, () => {

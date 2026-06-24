@@ -35,7 +35,11 @@ export function createOpenCodeAgentHarness(options?: {
       sourceVisibleReplies: "automatic",
     },
     nativeToolCapability: {
-      tools: ["sessions_send"],
+      tools: [
+        "sessions_send",
+        "sessions_list",
+        "sessions_history",
+      ],
     },
     supports(ctx) {
       const requestedRuntime = (ctx.requestedRuntime ?? "").trim().toLowerCase();

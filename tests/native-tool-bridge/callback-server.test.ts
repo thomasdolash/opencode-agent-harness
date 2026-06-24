@@ -9,6 +9,12 @@ import {
   type NativeToolAttemptBinding,
   type AgentHarnessNativeToolExecutor,
 } from "../../src/native-tool-bridge/callback-server.js";
+import {
+  CATALOG_ENTRIES,
+  buildCatalogEntryMap,
+  invokeNativeToolViaCallback,
+  type NativeToolCatalogEntry,
+} from "../../src/native-tool-bridge/tool-catalog.js";
 
 const CALLBACK_URL_KEY = "OPENCODE_NATIVE_TOOL_CALLBACK_URL";
 
@@ -247,13 +253,12 @@ describe("callback server lifecycle", () => {
     assert(portMatch);
     assert(Number(portMatch[1]) > 0);
 
-    // Verify the URL actually works
     const resp = await fetch(`${url}/native-tool`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ sessionId: "s", callId: "c", toolName: "sessions_send" }),
     });
-    assert.equal(resp.status, 404); // no active binding
+    assert.equal(resp.status, 404);
   });
 
   it("stop removes listener", async () => {
@@ -295,10 +300,8 @@ describe("callback URL propagation without provider call", () => {
   it("can issue loopback request to live callback server via env var URL", async () => {
     const url = await startNativeToolCallbackServer("127.0.0.1", 0);
     process.env[CALLBACK_URL_KEY] = url;
-
     registerNativeToolAttempt("test-session-p", makeBinding());
 
-    // This is what the OpenCode plugin does: reads env var, POSTs to it
     const callbackUrl = process.env[CALLBACK_URL_KEY];
     const resp = await fetch(`${callbackUrl}/native-tool`, {
       method: "POST",
@@ -351,7 +354,7 @@ describe("error mapping", () => {
     });
     const body = await resp.json() as { ok: boolean; error: string };
     assert(!body.ok);
-    assert(!body.error.includes("http://")); // no URL leak
+    assert(!body.error.includes("http://"));
   });
 
   it("callback server unavailable produces fetch error", async () => {
@@ -412,5 +415,350 @@ describe("error mapping", () => {
     const body = await resp.json() as { ok: boolean; result: { content: Array<{ type: string; text?: string }> } };
     assert(body.ok);
     assert.equal(body.result.content.length, 0);
+  });
+});
+
+describe("tool catalog", () => {
+  it("sessions_send remains registered and behaves identically", () => {
+    const entry = CATALOG_ENTRIES.find((e) => e.name === "sessions_send");
+    assert(entry);
+    assert.equal(entry.name, "sessions_send");
+    assert(typeof entry.description === "string" && entry.description.length > 0);
+    assert(entry.args.sessionKey);
+    assert(entry.args.message);
+    assert(entry.args.timeoutSeconds?.optional === true);
+  });
+
+  it("catalog registration produces only enabled static tools", () => {
+    const toolMap = buildCatalogEntryMap(CATALOG_ENTRIES);
+    const names = Object.keys(toolMap).sort();
+    assert.deepEqual(names, ["sessions_history", "sessions_list", "sessions_send"]);
+  });
+
+  it("every catalog entry has a corresponding tool in the map", () => {
+    const toolMap = buildCatalogEntryMap(CATALOG_ENTRIES);
+    for (const entry of CATALOG_ENTRIES) {
+      assert(toolMap[entry.name], `Missing tool for catalog entry: ${entry.name}`);
+      assert.equal(toolMap[entry.name].description, entry.description);
+    }
+  });
+
+  it("unknown catalog tools cannot be registered", () => {
+    const fakeEntry: NativeToolCatalogEntry = {
+      name: "sessions_spawn",
+      description: "spawn",
+      args: { task: { type: "string", description: "task" } },
+    };
+    const toolMap = buildCatalogEntryMap([fakeEntry]);
+    assert(toolMap.sessions_spawn);
+    // verify no mappings for non-catalog tools
+    assert(!("gateway" in toolMap));
+    assert(!("agents_list" in toolMap));
+    assert(!("cron" in toolMap));
+    assert(!("session_status" in toolMap));
+  });
+
+  it("invokeNativeToolViaCallback sends sessionId, fresh callId, toolName, arguments", async () => {
+    const url = await startNativeToolCallbackServer("127.0.0.1", 0);
+    process.env[CALLBACK_URL_KEY] = url;
+
+    const received: Array<Record<string, unknown>> = [];
+    const executor: AgentHarnessNativeToolExecutor = async (request) => {
+      received.push({ callId: request.callId, toolName: request.toolName, args: request.arguments });
+      return { content: [{ type: "text", text: "ok" }], details: {}, isError: false };
+    };
+    registerNativeToolAttempt("test-session-catalog", makeBinding({
+      openCodeSessionId: "test-session-catalog",
+      nativeToolExecutor: executor,
+      nativeToolDefinitions: [{ name: "sessions_list", description: "", parameters: {} }],
+    }));
+
+    const result = await invokeNativeToolViaCallback({
+      toolName: "sessions_list",
+      nativeArgs: { kinds: ["main"] },
+      context: { sessionID: "test-session-catalog" },
+      renderTitle: "sessions_list",
+    });
+
+    const parsed = JSON.parse(result) as { title: string; output: string };
+    assert.equal(parsed.title, "sessions_list");
+    assert.equal(parsed.output, "ok");
+    assert.equal(received.length, 1);
+    assert.equal(received[0].toolName, "sessions_list");
+    assert(typeof received[0].callId === "string" && (received[0].callId as string).length > 0);
+    assert.deepEqual(received[0].args, { kinds: ["main"] });
+  });
+
+  it("catalog tool unavailable from current nativeToolDefinitions returns deterministic error", async () => {
+    const url = await startNativeToolCallbackServer("127.0.0.1", 0);
+    process.env[CALLBACK_URL_KEY] = url;
+
+    registerNativeToolAttempt("test-other", makeBinding({
+      openCodeSessionId: "test-other",
+      nativeToolDefinitions: [{ name: "other_tool", description: "Other", parameters: {} }],
+    }));
+
+    const result = await invokeNativeToolViaCallback({
+      toolName: "sessions_list",
+      nativeArgs: {},
+      context: { sessionID: "test-other" },
+      renderTitle: "sessions_list",
+    });
+
+    const parsed = JSON.parse(result) as { title: string; output: string };
+    assert(parsed.title.includes("error"));
+    assert(parsed.output.includes("Native tool not available") || parsed.output.includes("failed"));
+  });
+
+  it("multiple text result chunks are joined in order", async () => {
+    const url = await startNativeToolCallbackServer("127.0.0.1", 0);
+    process.env[CALLBACK_URL_KEY] = url;
+
+    const executor: AgentHarnessNativeToolExecutor = async () => ({
+      content: [
+        { type: "text", text: "alpha" },
+        { type: "text", text: "beta" },
+        { type: "text", text: "gamma" },
+      ],
+      details: {},
+      isError: false,
+    });
+    registerNativeToolAttempt("test-join", makeBinding({
+      openCodeSessionId: "test-join",
+      nativeToolExecutor: executor,
+      nativeToolDefinitions: [{ name: "sessions_list", description: "", parameters: {} }],
+    }));
+
+    const result = await invokeNativeToolViaCallback({
+      toolName: "sessions_list",
+      nativeArgs: {},
+      context: { sessionID: "test-join" },
+      renderTitle: "sessions_list",
+    });
+
+    const parsed = JSON.parse(result) as { title: string; output: string };
+    assert.equal(parsed.title, "sessions_list");
+    assert.equal(parsed.output, "alpha\nbeta\ngamma");
+  });
+
+  it("error native results use the error title path", async () => {
+    const url = await startNativeToolCallbackServer("127.0.0.1", 0);
+    process.env[CALLBACK_URL_KEY] = url;
+
+    const executor: AgentHarnessNativeToolExecutor = async () => ({
+      content: [{ type: "text", text: "permission denied" }],
+      details: { status: "error" },
+      isError: true,
+    });
+    registerNativeToolAttempt("test-err", makeBinding({
+      openCodeSessionId: "test-err",
+      nativeToolExecutor: executor,
+      nativeToolDefinitions: [{ name: "sessions_list", description: "", parameters: {} }],
+    }));
+
+    const result = await invokeNativeToolViaCallback({
+      toolName: "sessions_list",
+      nativeArgs: {},
+      context: { sessionID: "test-err" },
+      renderTitle: "sessions_list",
+    });
+
+    const parsed = JSON.parse(result) as { title: string; output: string };
+    assert(parsed.title.includes("error"));
+    assert.equal(parsed.output, "permission denied");
+  });
+
+  it("callback transport unchanged for sessions_send", async () => {
+    const url = await startNativeToolCallbackServer("127.0.0.1", 0);
+    process.env[CALLBACK_URL_KEY] = url;
+
+    const executor: AgentHarnessNativeToolExecutor = async (request) => {
+      assert.equal(request.toolName, "sessions_send");
+      assert.deepEqual(request.arguments, { sessionKey: "parent", message: "hello", timeoutSeconds: 30 });
+      return { content: [{ type: "text", text: "delivered" }], details: {}, isError: false };
+    };
+    registerNativeToolAttempt("test-send", makeBinding({
+      openCodeSessionId: "test-send",
+      nativeToolExecutor: executor,
+      nativeToolDefinitions: [{ name: "sessions_send", description: "", parameters: {} }],
+    }));
+
+    const result = await invokeNativeToolViaCallback({
+      toolName: "sessions_send",
+      nativeArgs: { sessionKey: "parent", message: "hello", timeoutSeconds: 30 },
+      context: { sessionID: "test-send" },
+      renderTitle: "sessions_send",
+    });
+
+    const parsed = JSON.parse(result) as { title: string; output: string };
+    assert.equal(parsed.title, "sessions_send");
+    assert.equal(parsed.output, "delivered");
+  });
+});
+
+describe("sessions_list catalog entry", () => {
+  afterEach(() => {
+    stopNativeToolCallbackServer();
+    delete process.env[CALLBACK_URL_KEY];
+  });
+
+  it("has correct schema fields", () => {
+    const entry = CATALOG_ENTRIES.find((e) => e.name === "sessions_list")!;
+    assert(entry);
+    assert(typeof entry.description === "string" && entry.description.length > 0);
+    assert(entry.args.kinds);
+    assert(entry.args.limit);
+    assert(entry.args.activeMinutes);
+    assert(entry.args.label);
+    assert(entry.args.agentId);
+    assert(entry.args.search);
+    assert(entry.args.includeDerivedTitles);
+    assert(entry.args.includeLastMessage);
+  });
+
+  it("callback argument serialization preserves expected fields", async () => {
+    const url = await startNativeToolCallbackServer("127.0.0.1", 0);
+    process.env[CALLBACK_URL_KEY] = url;
+
+    const received: Array<Record<string, unknown>> = [];
+    const executor: AgentHarnessNativeToolExecutor = async (request) => {
+      received.push(request.arguments as Record<string, unknown>);
+      return { content: [{ type: "text", text: "[]" }], details: {}, isError: false };
+    };
+    registerNativeToolAttempt("test-ls", makeBinding({
+      openCodeSessionId: "test-ls",
+      nativeToolExecutor: executor,
+      nativeToolDefinitions: [{ name: "sessions_list", description: "", parameters: {} }],
+    }));
+
+    await invokeNativeToolViaCallback({
+      toolName: "sessions_list",
+      nativeArgs: { kinds: ["main", "subagent"], limit: 10, agentId: "opencode" },
+      context: { sessionID: "test-ls" },
+      renderTitle: "sessions_list",
+    });
+
+    assert.equal(received.length, 1);
+    assert.deepEqual(received[0], { kinds: ["main", "subagent"], limit: 10, agentId: "opencode" });
+  });
+
+  it("native result rendering works for structured sessions_list output", async () => {
+    const entry = CATALOG_ENTRIES.find((e) => e.name === "sessions_list")!;
+    const rendered = entry.renderResult!({
+      content: [{ type: "text", text: JSON.stringify([
+        { key: "agent:main:abc", agentId: "default", kind: "main", label: "My Session" },
+        { key: "agent:opencode:subagent:123", agentId: "opencode", kind: "subagent", spawnedBy: "agent:main:abc", lastMessagePreview: "Hello world" },
+      ]) }],
+      details: {},
+      isError: false,
+    });
+    assert.equal(rendered.title, "sessions_list");
+    assert(rendered.output.includes("agent:main:abc"));
+    assert(rendered.output.includes("agent=default"));
+    assert(rendered.output.includes("agent:opencode:subagent:123"));
+    assert(rendered.output.includes("agent=opencode"));
+    assert(!rendered.output.includes("Native tool completed"));
+  });
+
+  it("unavailable-per-attempt returns callback error", async () => {
+    const url = await startNativeToolCallbackServer("127.0.0.1", 0);
+    process.env[CALLBACK_URL_KEY] = url;
+
+    registerNativeToolAttempt("test-ls-unavail", makeBinding({
+      openCodeSessionId: "test-ls-unavail",
+      nativeToolDefinitions: [],
+    }));
+
+    const result = await invokeNativeToolViaCallback({
+      toolName: "sessions_list",
+      nativeArgs: {},
+      context: { sessionID: "test-ls-unavail" },
+      renderTitle: "sessions_list",
+    });
+
+    const parsed = JSON.parse(result) as { title: string; output: string };
+    assert(parsed.title.includes("error"));
+  });
+});
+
+describe("sessions_history catalog entry", () => {
+  afterEach(() => {
+    stopNativeToolCallbackServer();
+    delete process.env[CALLBACK_URL_KEY];
+  });
+
+  it("has correct schema fields", () => {
+    const entry = CATALOG_ENTRIES.find((e) => e.name === "sessions_history")!;
+    assert(entry);
+    assert(typeof entry.description === "string" && entry.description.length > 0);
+    assert(entry.args.sessionKey);
+    assert(entry.args.limit);
+    assert(entry.args.includeTools);
+    // sessionKey is not optional
+    assert(!entry.args.sessionKey.optional);
+  });
+
+  it("callback argument serialization preserves expected fields", async () => {
+    const url = await startNativeToolCallbackServer("127.0.0.1", 0);
+    process.env[CALLBACK_URL_KEY] = url;
+
+    const received: Array<Record<string, unknown>> = [];
+    const executor: AgentHarnessNativeToolExecutor = async (request) => {
+      received.push(request.arguments as Record<string, unknown>);
+      return { content: [{ type: "text", text: "[]" }], details: {}, isError: false };
+    };
+    registerNativeToolAttempt("test-hx", makeBinding({
+      openCodeSessionId: "test-hx",
+      nativeToolExecutor: executor,
+      nativeToolDefinitions: [{ name: "sessions_history", description: "", parameters: {} }],
+    }));
+
+    await invokeNativeToolViaCallback({
+      toolName: "sessions_history",
+      nativeArgs: { sessionKey: "agent:main:test", limit: 5, includeTools: true },
+      context: { sessionID: "test-hx" },
+      renderTitle: "sessions_history",
+    });
+
+    assert.equal(received.length, 1);
+    assert.deepEqual(received[0], { sessionKey: "agent:main:test", limit: 5, includeTools: true });
+  });
+
+  it("native result rendering works for structured sessions_history output", async () => {
+    const entry = CATALOG_ENTRIES.find((e) => e.name === "sessions_history")!;
+    const rendered = entry.renderResult!({
+      content: [{ type: "text", text: JSON.stringify({
+        messages: [
+          { role: "user", content: "Hello" },
+          { role: "assistant", content: "Hi there" },
+        ],
+      }) }],
+      details: {},
+      isError: false,
+    });
+    assert.equal(rendered.title, "sessions_history");
+    assert(rendered.output.includes("user: Hello"));
+    assert(rendered.output.includes("assistant: Hi there"));
+    assert(!rendered.output.includes("Native tool completed"));
+  });
+
+  it("unavailable-per-attempt returns callback error", async () => {
+    const url = await startNativeToolCallbackServer("127.0.0.1", 0);
+    process.env[CALLBACK_URL_KEY] = url;
+
+    registerNativeToolAttempt("test-hx-unavail", makeBinding({
+      openCodeSessionId: "test-hx-unavail",
+      nativeToolDefinitions: [],
+    }));
+
+    const result = await invokeNativeToolViaCallback({
+      toolName: "sessions_history",
+      nativeArgs: { sessionKey: "agent:main:x" },
+      context: { sessionID: "test-hx-unavail" },
+      renderTitle: "sessions_history",
+    });
+
+    const parsed = JSON.parse(result) as { title: string; output: string };
+    assert(parsed.title.includes("error"));
   });
 });

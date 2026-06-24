@@ -3,6 +3,12 @@ import {
   type OpenCodeAgentHarnessPluginConfig,
 } from "../config.js";
 import type { OpenCodeHarnessLogger } from "../logger.js";
+import {
+  startNativeToolCallbackServer,
+  stopNativeToolCallbackServer,
+} from "../native-tool-bridge/callback-server.js";
+import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
 
 type OpenCodeManagedServer = {
   url: string;
@@ -83,6 +89,8 @@ export type OpenCodeHarnessClient = {
 
 let sharedClient: OpenCodeHarnessClient | undefined;
 let sharedManagedServer: OpenCodeManagedServer | undefined;
+let priorCallbackUrl: string | undefined;
+const CALLBACK_URL_KEY = "OPENCODE_NATIVE_TOOL_CALLBACK_URL";
 
 function resolveBaseUrl(opts: { pluginConfig?: unknown }): string {
   const pluginConfig = opts.pluginConfig
@@ -470,10 +478,32 @@ export async function createSharedOpenCodeHarnessClient(opts: {
       mode: "managed" as const,
     },
   };
-  const baseUrl =
-    pluginConfig.server.mode === "managed"
-      ? await ensureManagedOpenCodeServer(pluginConfig, opts.managedServerFactory)
-      : resolveBaseUrl({ pluginConfig });
+
+  if (pluginConfig.server.mode === "managed") {
+    priorCallbackUrl = process.env[CALLBACK_URL_KEY];
+    const callbackUrl = await startNativeToolCallbackServer();
+    process.env[CALLBACK_URL_KEY] = callbackUrl;
+    opts.logger?.debug?.("started native tool callback server", { url: callbackUrl });
+  }
+
+  let baseUrl: string;
+  try {
+    baseUrl =
+      pluginConfig.server.mode === "managed"
+        ? await ensureManagedOpenCodeServer(pluginConfig, opts.managedServerFactory)
+        : resolveBaseUrl({ pluginConfig });
+  } catch (error) {
+    if (pluginConfig.server.mode === "managed") {
+      stopNativeToolCallbackServer();
+      if (priorCallbackUrl === undefined) {
+        delete process.env[CALLBACK_URL_KEY];
+      } else {
+        process.env[CALLBACK_URL_KEY] = priorCallbackUrl;
+      }
+      priorCallbackUrl = undefined;
+    }
+    throw error;
+  }
   opts.logger?.debug?.("initializing OpenCode client", {
     mode: pluginConfig.server.mode,
     baseUrl,
@@ -1143,9 +1173,16 @@ export async function clearSharedOpenCodeHarnessClientAndWait(): Promise<void> {
   try {
     await sharedClient?.close?.();
     sharedManagedServer?.close();
+    stopNativeToolCallbackServer();
   } finally {
     sharedClient = undefined;
     sharedManagedServer = undefined;
+    if (priorCallbackUrl === undefined) {
+      delete process.env[CALLBACK_URL_KEY];
+    } else {
+      process.env[CALLBACK_URL_KEY] = priorCallbackUrl;
+    }
+    priorCallbackUrl = undefined;
   }
 }
 
@@ -1161,10 +1198,15 @@ async function ensureManagedOpenCodeServer(
     managedServerFactory ??
     (async (config: OpenCodeAgentHarnessPluginConfig) => {
       const sdk = await import("@opencode-ai/sdk/server");
+      const pluginModulePath = fileURLToPath(new URL("../native-tool-bridge/opencode-tool-plugin.ts", import.meta.url));
+      const pluginPath = resolve(pluginModulePath);
       return sdk.createOpencodeServer({
         ...(config.server.hostname ? { hostname: config.server.hostname } : {}),
         ...(config.server.port ? { port: config.server.port } : {}),
         ...(config.server.timeoutMs ? { timeout: config.server.timeoutMs } : {}),
+        config: {
+          plugin: [pluginPath],
+        },
       });
     });
 

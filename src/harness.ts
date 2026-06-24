@@ -34,6 +34,9 @@ export function createOpenCodeAgentHarness(options?: {
     deliveryDefaults: {
       sourceVisibleReplies: "automatic",
     },
+    nativeToolCapability: {
+      tools: ["sessions_send"],
+    },
     supports(ctx) {
       const requestedRuntime = (ctx.requestedRuntime ?? "").trim().toLowerCase();
       if (requestedRuntime === "opencode") {

@@ -13,6 +13,8 @@
     "build": "tsc -p ./tsconfig.json",
     "typecheck": "tsc -p ./tsconfig.json --noEmit",
     "smoke": "node --import tsx ./scripts/smoke-run-attempt.ts",
+    "test": "node --import tsx ./scripts/run-tests.ts",
+    "test:bridge": "node --import tsx ./scripts/run-tests.ts tests/native-tool-bridge/",
     "probe:reasoning": "node --import tsx ./scripts/reasoning-level-probe.ts",
     "probe:reasoning-gateway": "node --import tsx ./scripts/reasoning-gateway-probe.ts",
     "probe:live": "node --import tsx ./scripts/live-gateway-probe.ts"
@@ -25,7 +27,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.19.21",
-    "openclaw": "^2026.6.8",
+    "openclaw": "file:/home/comra/_workspace/repos/openclaw/packages/openclaw-local/openclaw-2026.6.9.tgz",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3"
   },

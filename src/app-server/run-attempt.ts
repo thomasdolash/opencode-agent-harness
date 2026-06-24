@@ -24,6 +24,10 @@ import {
   buildOpenCodeUserPromptMessage,
   mirrorOpenCodeAttemptToTranscript,
 } from "./transcript-mirror.js";
+import {
+  registerNativeToolAttempt,
+  unregisterNativeToolAttempt,
+} from "../native-tool-bridge/callback-server.js";
 
 function extractPromptText(params: AgentHarnessAttemptParams): string {
   if (typeof params.prompt === "string" && params.prompt.trim() !== "") {
@@ -336,6 +340,14 @@ export async function runOpenCodeHarnessAttempt(
     });
   }
 
+  const nativeToolBinding = {
+    openCodeSessionId,
+    nativeToolDefinitions: params.nativeToolDefinitions,
+    nativeToolExecutor: params.nativeToolExecutor,
+    abortSignal: params.abortSignal,
+  };
+  registerNativeToolAttempt(openCodeSessionId, nativeToolBinding);
+
   let abortListener: (() => void) | undefined;
   if (params.abortSignal && client.abort) {
     abortListener = () => {
@@ -349,9 +361,19 @@ export async function runOpenCodeHarnessAttempt(
   }
 
   try {
-    const requestPayload = {
+    const systemParts: string[] = [];
+    if (params.spawnedBy) {
+      systemParts.push(
+        `Your OpenClaw parent session key is: ${params.spawnedBy}.`,
+        `Use sessions_send with this key when you need to report progress, ask a question, or return a result.`,
+      );
+    }
+    const requestPayload: Record<string, unknown> = {
       parts: [{ type: "text", text: promptText }],
     };
+    if (systemParts.length > 0) {
+      requestPayload.system = systemParts.join("\n\n");
+    }
     const streamMessage = client.streamMessage;
     const supportsStreaming = Boolean(
       streamMessage &&
@@ -543,6 +565,7 @@ export async function runOpenCodeHarnessAttempt(
     });
     throw new Error(`OpenCode harness turn failed: ${String((error as Error)?.message ?? error)}`);
   } finally {
+    unregisterNativeToolAttempt(openCodeSessionId, nativeToolBinding);
     if (abortListener) {
       params.abortSignal?.removeEventListener("abort", abortListener);
     }
